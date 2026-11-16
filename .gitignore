@@ -1,0 +1,3 @@
+/target
+# snapshots can contain database logs; keep them out of git
+/awstate-*/
