@@ -36,9 +36,19 @@ pub async fn collect_one(ctx: &Ctx, spec: Spec) -> Resource {
         notes: spec.notes,
     };
 
-    if let (true, Some((namespace, dimension))) = (ctx.metrics, spec.metric_source) {
+    if ctx.metrics && !spec.metric_sources.is_empty() {
         let collected = async {
-            let series = metrics::collect(ctx, namespace, dimension, &resource.id).await?;
+            let mut series = Vec::new();
+            for source in &spec.metric_sources {
+                series.extend(metrics::collect(ctx, source).await?);
+            }
+            series.sort_by(|a, b| {
+                (&a.head.namespace, &a.head.name, &a.head.dimensions).cmp(&(
+                    &b.head.namespace,
+                    &b.head.name,
+                    &b.head.dimensions,
+                ))
+            });
             let file = write_metrics(ctx, &rel_dir, &series).await?;
             anyhow::Ok((series, file))
         }
@@ -53,10 +63,12 @@ pub async fn collect_one(ctx: &Ctx, spec: Spec) -> Resource {
     }
 
     if ctx.logs_enabled {
-        for group in &spec.log_groups {
-            match logs::capture_group(ctx, group, &rel_dir).await {
+        for source in &spec.log_sources {
+            match logs::capture_group(ctx, source, &rel_dir).await {
                 Ok(capture) => resource.logs.push(capture),
-                Err(err) => ctx.issues.record(format!("{scope} logs {group}"), &err),
+                Err(err) => ctx
+                    .issues
+                    .record(format!("{scope} logs {}", source.group), &err),
             }
         }
     }

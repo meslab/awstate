@@ -10,7 +10,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use clap::{Parser, ValueEnum};
 
-/// Pull RDS and ElastiCache metrics, logs, and events for a time window
+/// Pull RDS, ElastiCache, EC2 Auto Scaling, and ECS metrics, logs, and events for a time window
 /// into a directory laid out for AI analysis.
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -36,7 +36,7 @@ pub struct Args {
     pub profile: Option<String>,
 
     /// Services to collect.
-    #[arg(long, value_enum, value_delimiter = ',', default_values_t = [Service::Rds, Service::Elasticache])]
+    #[arg(long, value_enum, value_delimiter = ',', default_values_t = [Service::Rds, Service::Elasticache, Service::Asg, Service::Ecs])]
     pub services: Vec<Service>,
 
     /// Data kinds to skip.
@@ -88,6 +88,10 @@ pub enum Service {
     Rds,
     /// Amazon ElastiCache.
     Elasticache,
+    /// EC2 Auto Scaling groups.
+    Asg,
+    /// Amazon ECS clusters and services.
+    Ecs,
 }
 
 /// A kind of data collected per resource.

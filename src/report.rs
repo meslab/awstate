@@ -128,13 +128,16 @@ fn render_resource(md: &mut String, r: &Resource) {
 
     if let Some(file) = &r.metrics_file {
         let _ = writeln!(md, "\nMetrics (series in `{file}`):\n");
-        md.push_str("| metric | dimensions | avg | min | max | p95 | first | last | max at |\n");
-        md.push_str("|---|---|---|---|---|---|---|---|---|\n");
+        md.push_str(
+            "| namespace | metric | dimensions | avg | min | max | p95 | first | last | max at |\n",
+        );
+        md.push_str("|---|---|---|---|---|---|---|---|---|---|\n");
         for m in &r.metrics {
             let s = &m.summary;
             let _ = writeln!(
                 md,
-                "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                m.namespace,
                 m.name,
                 extra_dimensions(m, &r.id),
                 fmt_num(s.avg),
@@ -213,11 +216,12 @@ fn render_events(md: &mut String, service: &str, events: &[Event], enabled: bool
     }
 }
 
-/// Dimensions other than the one naming the resource itself.
+/// Dimensions other than those naming the resource itself (identifiers
+/// like `cluster/service` name it with several).
 fn extra_dimensions(m: &MetricHead, resource_id: &str) -> String {
     m.dimensions
         .iter()
-        .filter(|(_, v)| v.as_str() != resource_id)
+        .filter(|(_, v)| resource_id.split('/').all(|part| part != v.as_str()))
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join(", ")

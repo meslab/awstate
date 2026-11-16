@@ -5,16 +5,18 @@ use std::fmt::Write as _;
 use anyhow::{Context, Result};
 
 use crate::collect::write_file;
+use crate::model::{Ctx, LogCapture, LogSource, iso_millis, sanitize};
 
-use crate::model::{Ctx, LogCapture, iso_millis, sanitize};
-
-/// Pulls the window's events from `group` into `<rel_dir>/logs/<group>.log`,
-/// one `timestamp [stream] message` line per event, earliest first.
-pub async fn capture_group(ctx: &Ctx, group: &str, rel_dir: &str) -> Result<LogCapture> {
+/// Pulls the window's events from a log source into
+/// `<rel_dir>/logs/<group>.log`, one `timestamp [stream] message` line per
+/// event, earliest first.
+pub async fn capture_group(ctx: &Ctx, source: &LogSource, rel_dir: &str) -> Result<LogCapture> {
+    let group = source.group.as_str();
     let mut pages = ctx
         .logs
         .filter_log_events()
         .log_group_name(group)
+        .set_log_stream_name_prefix(source.stream_prefix.clone())
         .start_time(ctx.window.start.timestamp_millis())
         .end_time(ctx.window.end.timestamp_millis())
         .set_filter_pattern(ctx.log_filter_pattern.clone())
@@ -40,10 +42,16 @@ pub async fn capture_group(ctx: &Ctx, group: &str, rel_dir: &str) -> Result<LogC
         }
     }
 
-    let source = format!("cloudwatch-logs:{group}");
-    let file = write_log(ctx, rel_dir, group, &text).await?;
+    let name = match &source.stream_prefix {
+        Some(prefix) => format!("{group}__{prefix}"),
+        None => group.to_owned(),
+    };
+    let file = write_log(ctx, rel_dir, &name, &text).await?;
     Ok(LogCapture {
-        source,
+        source: match &source.stream_prefix {
+            Some(prefix) => format!("cloudwatch-logs:{group} (streams {prefix}*)"),
+            None => format!("cloudwatch-logs:{group}"),
+        },
         file,
         lines,
         bytes: text.len(),

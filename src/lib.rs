@@ -1,9 +1,12 @@
-//! `awstate` snapshots the recent state of RDS and `ElastiCache` resources
+//! `awstate` snapshots the recent state of RDS, `ElastiCache`, EC2 Auto
+//! Scaling, and ECS resources
 //! (inventory, `CloudWatch` metrics, logs, and service events) into a
 //! directory designed to be handed to an AI model for analysis.
 
+mod asg;
 pub mod cli;
 mod collect;
+mod ecs;
 mod elasticache;
 mod logs;
 mod metrics;
@@ -14,7 +17,9 @@ mod report;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail, ensure};
-use aws_config::{BehaviorVersion, Region};
+use aws_config::retry::RetryConfig;
+use aws_config::{BehaviorVersion, Region, SdkConfig};
+use aws_credential_types::provider::ProvideCredentials;
 use chrono::Utc;
 
 use cli::{Args, DataKind, Service};
@@ -31,17 +36,7 @@ pub async fn run(args: Args) -> Result<PathBuf> {
     let window = resolve_window(&args)?;
     let metric_period = resolve_metric_period(&args, window)?;
 
-    let mut loader = aws_config::defaults(BehaviorVersion::latest());
-    if let Some(region) = &args.region {
-        loader = loader.region(Region::new(region.clone()));
-    }
-    if let Some(profile) = &args.profile {
-        loader = loader.profile_name(profile);
-    }
-    let config = loader.load().await;
-    let Some(region) = config.region().map(ToString::to_string) else {
-        bail!("no AWS region configured; pass --region or set AWS_REGION");
-    };
+    let (config, region) = load_aws_config(&args).await?;
 
     let root = args.output.clone().unwrap_or_else(|| {
         PathBuf::from(format!("awstate-{}", Utc::now().format("%Y%m%dT%H%M%SZ")))
@@ -72,7 +67,12 @@ pub async fn run(args: Args) -> Result<PathBuf> {
     let rds_client = aws_sdk_rds::Client::new(&config);
     let elasticache_client = aws_sdk_elasticache::Client::new(&config);
 
-    let (rds_report, elasticache_report) = tokio::join!(
+    let want_asg = args.services.contains(&Service::Asg);
+    let want_ecs = args.services.contains(&Service::Ecs);
+    let asg_client = aws_sdk_autoscaling::Client::new(&config);
+    let ecs_client = aws_sdk_ecs::Client::new(&config);
+
+    let (rds_report, elasticache_report, asg_report, ecs_report) = tokio::join!(
         async {
             if want_rds {
                 Some(rds::collect(&ctx, &rds_client).await)
@@ -86,14 +86,32 @@ pub async fn run(args: Args) -> Result<PathBuf> {
             } else {
                 None
             }
+        },
+        async {
+            if want_asg {
+                Some(asg::collect(&ctx, &asg_client).await)
+            } else {
+                None
+            }
+        },
+        async {
+            if want_ecs {
+                Some(ecs::collect(&ctx, &ecs_client).await)
+            } else {
+                None
+            }
         }
     );
 
-    let services: Vec<(&str, ServiceReport)> =
-        [("rds", rds_report), ("elasticache", elasticache_report)]
-            .into_iter()
-            .filter_map(|(name, report)| Some((name, report?)))
-            .collect();
+    let services: Vec<(&str, ServiceReport)> = [
+        ("rds", rds_report),
+        ("elasticache", elasticache_report),
+        ("asg", asg_report),
+        ("ecs", ecs_report),
+    ]
+    .into_iter()
+    .filter_map(|(name, report)| Some((name, report?)))
+    .collect();
 
     report::write(&ctx, &region, &services).await?;
 
@@ -109,6 +127,37 @@ pub async fn run(args: Args) -> Result<PathBuf> {
         println!("{issues} collection issue(s); see summary.md");
     }
     Ok(ctx.root)
+}
+
+/// Loads AWS configuration and verifies that a region and working
+/// credentials are available.
+async fn load_aws_config(args: &Args) -> Result<(SdkConfig, String)> {
+    let mut loader = aws_config::defaults(BehaviorVersion::latest());
+    if let Some(region) = &args.region {
+        loader = loader.region(Region::new(region.clone()));
+    }
+    if let Some(profile) = &args.profile {
+        loader = loader.profile_name(profile);
+    }
+    // Collection fans out many CloudWatch calls at once; the default three
+    // attempts are not enough to ride out throttling.
+    let config = loader
+        .retry_config(RetryConfig::adaptive().with_max_attempts(10))
+        .load()
+        .await;
+    let Some(region) = config.region().map(ToString::to_string) else {
+        bail!("no AWS region configured; pass --region or set AWS_REGION");
+    };
+
+    // Fail fast on unusable credentials (an expired SSO session, say);
+    // otherwise every call would fail and yield an empty snapshot.
+    let Some(credentials) = config.credentials_provider() else {
+        bail!("no AWS credentials configured; pass --profile or set AWS_PROFILE");
+    };
+    credentials.provide_credentials().await.context(
+        "could not load AWS credentials; if you use SSO, run `aws sso login` for this profile",
+    )?;
+    Ok((config, region))
 }
 
 fn resolve_window(args: &Args) -> Result<Window> {

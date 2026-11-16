@@ -106,16 +106,61 @@ impl Issues {
     }
 }
 
+/// A set of `CloudWatch` metrics belonging to a resource: everything in
+/// `namespace` that carries all of `dimensions`.
+pub struct MetricSource {
+    pub namespace: &'static str,
+    pub dimensions: Vec<(&'static str, String)>,
+    /// When true, metrics with dimensions beyond the listed ones are
+    /// excluded. Needed where a parent's dimension also appears on its
+    /// children's metrics (an ECS cluster and its services).
+    pub exact: bool,
+}
+
+impl MetricSource {
+    /// Every metric carrying `dimension = value`, whatever else it carries.
+    pub fn by(namespace: &'static str, dimension: &'static str, value: &str) -> Self {
+        Self {
+            namespace,
+            dimensions: vec![(dimension, value.to_owned())],
+            exact: false,
+        }
+    }
+
+    /// Only metrics whose dimensions are exactly `dimensions`.
+    pub fn exact(namespace: &'static str, dimensions: Vec<(&'static str, String)>) -> Self {
+        Self {
+            namespace,
+            dimensions,
+            exact: true,
+        }
+    }
+}
+
+/// A `CloudWatch` log group, optionally narrowed to streams with a prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogSource {
+    pub group: String,
+    pub stream_prefix: Option<String>,
+}
+
+impl From<String> for LogSource {
+    fn from(group: String) -> Self {
+        Self {
+            group,
+            stream_prefix: None,
+        }
+    }
+}
+
 /// What to collect for one resource, produced by a service's inventory pass.
 pub struct Spec {
     pub service: &'static str,
     pub kind: &'static str,
     pub id: String,
     pub details: Value,
-    /// `CloudWatch` namespace and the dimension name that identifies this
-    /// resource; every metric carrying that dimension is collected.
-    pub metric_source: Option<(&'static str, &'static str)>,
-    pub log_groups: Vec<String>,
+    pub metric_sources: Vec<MetricSource>,
+    pub log_sources: Vec<LogSource>,
     pub notes: Vec<String>,
 }
 
@@ -164,6 +209,7 @@ pub struct Resource {
 /// Identity and summary statistics of one metric, without its datapoints.
 #[derive(Debug, Clone, Serialize)]
 pub struct MetricHead {
+    pub namespace: String,
     pub name: String,
     pub dimensions: BTreeMap<String, String>,
     pub summary: MetricSummary,

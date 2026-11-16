@@ -10,7 +10,7 @@ use aws_sdk_elasticache::types::{
 use serde_json::{Value, json};
 
 use crate::collect::collect_all;
-use crate::model::{Ctx, Event, ServiceReport, Spec, iso};
+use crate::model::{Ctx, Event, LogSource, MetricSource, ServiceReport, Spec, iso};
 
 const SERVICE: &str = "elasticache";
 const NAMESPACE: &str = "AWS/ElastiCache";
@@ -176,8 +176,12 @@ fn cache_cluster_spec(c: &CacheCluster) -> Spec {
         kind: "cache-cluster",
         id: c.cache_cluster_id().unwrap_or_default().to_owned(),
         details,
-        metric_source: Some((NAMESPACE, "CacheClusterId")),
-        log_groups,
+        metric_sources: vec![MetricSource::by(
+            NAMESPACE,
+            "CacheClusterId",
+            c.cache_cluster_id().unwrap_or_default(),
+        )],
+        log_sources: log_groups.into_iter().map(LogSource::from).collect(),
         notes,
     }
 }
@@ -232,8 +236,8 @@ fn replication_group_spec(g: &ReplicationGroup) -> Spec {
         kind: "replication-group",
         id: g.replication_group_id().unwrap_or_default().to_owned(),
         details,
-        metric_source: None,
-        log_groups,
+        metric_sources: Vec::new(),
+        log_sources: log_groups.into_iter().map(LogSource::from).collect(),
         notes,
     }
 }
@@ -261,8 +265,12 @@ fn serverless_spec(c: &ServerlessCache) -> Spec {
         id: c.serverless_cache_name().unwrap_or_default().to_owned(),
         details,
         // Serverless caches publish under a lowercase `clusterId` dimension.
-        metric_source: Some((NAMESPACE, "clusterId")),
-        log_groups: Vec::new(),
+        metric_sources: vec![MetricSource::by(
+            NAMESPACE,
+            "clusterId",
+            c.serverless_cache_name().unwrap_or_default(),
+        )],
+        log_sources: Vec::new(),
         notes: Vec::new(),
     }
 }

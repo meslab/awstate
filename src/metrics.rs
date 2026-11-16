@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 use aws_sdk_cloudwatch::types::{DimensionFilter, Metric, MetricDataQuery, MetricStat, ScanBy};
 
-use crate::model::{Ctx, MetricHead, MetricSeries, MetricSummary, iso};
+use crate::model::{Ctx, MetricHead, MetricSeries, MetricSource, MetricSummary, iso};
 
 /// Statistics requested per metric, with their query-id suffix and the
 /// column they fill.
@@ -18,39 +18,44 @@ const STATS: [(&str, &str); 3] = [("Average", "a"), ("Minimum", "n"), ("Maximum"
 /// `GetMetricData` accepts at most 500 queries per request.
 const METRICS_PER_REQUEST: usize = 500 / STATS.len();
 
-/// Fetches every metric in `namespace` that has dimension `dimension = value`.
-/// Metrics without datapoints in the window are dropped.
-pub async fn collect(
-    ctx: &Ctx,
-    namespace: &str,
-    dimension: &str,
-    value: &str,
-) -> Result<Vec<MetricSeries>> {
-    let metrics = discover(ctx, namespace, dimension, value).await?;
+/// Fetches every metric matching `source`. Metrics without datapoints in
+/// the window are dropped.
+pub async fn collect(ctx: &Ctx, source: &MetricSource) -> Result<Vec<MetricSeries>> {
+    let metrics = discover(ctx, source).await?;
     let mut out = Vec::with_capacity(metrics.len());
     for chunk in metrics.chunks(METRICS_PER_REQUEST) {
         out.extend(fetch(ctx, chunk).await?);
     }
-    out.sort_by(|a, b| (&a.head.name, &a.head.dimensions).cmp(&(&b.head.name, &b.head.dimensions)));
     Ok(out)
 }
 
-async fn discover(ctx: &Ctx, namespace: &str, dimension: &str, value: &str) -> Result<Vec<Metric>> {
-    let filter = DimensionFilter::builder()
-        .name(dimension)
-        .value(value)
-        .build();
+async fn discover(ctx: &Ctx, source: &MetricSource) -> Result<Vec<Metric>> {
+    let namespace = source.namespace;
+    let filters = source
+        .dimensions
+        .iter()
+        .map(|(name, value)| DimensionFilter::builder().name(*name).value(value).build())
+        .collect();
+    let value = source
+        .dimensions
+        .iter()
+        .map(|(_, v)| v.as_str())
+        .collect::<Vec<_>>()
+        .join("/");
     let mut pages = ctx
         .cw
         .list_metrics()
         .namespace(namespace)
-        .dimensions(filter)
+        .set_dimensions(Some(filters))
         .into_paginator()
         .send();
     let mut metrics = Vec::new();
     while let Some(page) = pages.next().await {
         let page = page.with_context(|| format!("listing {namespace} metrics for {value}"))?;
         metrics.extend(page.metrics.unwrap_or_default());
+    }
+    if source.exact {
+        metrics.retain(|m| m.dimensions().len() == source.dimensions.len());
     }
     Ok(metrics)
 }
@@ -132,6 +137,7 @@ fn build_series(metric: &Metric, points: &Points, period: i32) -> Option<MetricS
         .collect();
     Some(MetricSeries {
         head: MetricHead {
+            namespace: metric.namespace().unwrap_or_default().to_owned(),
             name: metric.metric_name().unwrap_or_default().to_owned(),
             dimensions,
             summary,

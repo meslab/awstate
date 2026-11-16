@@ -10,7 +10,8 @@ use serde_json::json;
 
 use crate::collect::{collect_one, write_file};
 use crate::model::{
-    Ctx, Event, LogCapture, Resource, ServiceReport, Spec, iso, iso_millis, sanitize,
+    Ctx, Event, LogCapture, LogSource, MetricSource, Resource, ServiceReport, Spec, iso,
+    iso_millis, sanitize,
 };
 
 const SERVICE: &str = "rds";
@@ -68,7 +69,7 @@ async fn collect_resources(ctx: &Ctx, client: &Client) -> Vec<Resource> {
             .db_cluster_identifier()
             .is_some_and(|c| clusters_exporting_logs.contains(c));
         let spec = instance_spec(instance);
-        let download = spec.log_groups.is_empty() && !cluster_exports;
+        let download = spec.log_sources.is_empty() && !cluster_exports;
         jobs.push((spec, download));
     }
 
@@ -122,12 +123,12 @@ fn instance_spec(i: &DbInstance) -> Spec {
     let exports = i.enabled_cloudwatch_logs_exports();
     let in_cluster = i.db_cluster_identifier().is_some();
 
-    let log_groups = if in_cluster {
+    let log_sources = if in_cluster {
         Vec::new()
     } else {
         exports
             .iter()
-            .map(|kind| format!("/aws/rds/instance/{id}/{kind}"))
+            .map(|kind| LogSource::from(format!("/aws/rds/instance/{id}/{kind}")))
             .collect()
     };
 
@@ -177,8 +178,12 @@ fn instance_spec(i: &DbInstance) -> Spec {
         kind: "instance",
         id,
         details,
-        metric_source: Some((NAMESPACE, "DBInstanceIdentifier")),
-        log_groups,
+        metric_sources: vec![MetricSource::by(
+            NAMESPACE,
+            "DBInstanceIdentifier",
+            i.db_instance_identifier().unwrap_or_default(),
+        )],
+        log_sources,
         notes: Vec::new(),
     }
 }
@@ -222,13 +227,17 @@ fn cluster_spec(c: &DbCluster) -> Spec {
     Spec {
         service: SERVICE,
         kind: "cluster",
-        log_groups: exports
+        log_sources: exports
             .iter()
-            .map(|kind| format!("/aws/rds/cluster/{id}/{kind}"))
+            .map(|kind| LogSource::from(format!("/aws/rds/cluster/{id}/{kind}")))
             .collect(),
         id,
         details,
-        metric_source: Some((NAMESPACE, "DBClusterIdentifier")),
+        metric_sources: vec![MetricSource::by(
+            NAMESPACE,
+            "DBClusterIdentifier",
+            c.db_cluster_identifier().unwrap_or_default(),
+        )],
         notes: Vec::new(),
     }
 }
