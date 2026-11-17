@@ -49,10 +49,7 @@
         "elasticache:DescribeReplicationGroups",
         "elasticache:DescribeServerlessCaches"
       ],
-      "Resource": [
-        "arn:aws:elasticache:*:*:cluster:*",
-        "arn:aws:elasticache:*:*:replication-group:*"
-      ]
+      "Resource": "*"
     },
     {
       "Sid": "ElastiCacheEvents",
@@ -69,9 +66,7 @@
         "autoscaling:DescribeAutoScalingGroups",
         "autoscaling:DescribeScalingActivities"
       ],
-      "Resource": [
-        "arn:aws:autoscaling:*:*:autoScalingGroup/*:autoScalingGroupName/*"
-      ]
+      "Resource": "*"
     },
     {
       "Sid": "EcsRead",
@@ -85,9 +80,7 @@
         "ecs:ListTasks",
         "ecs:DescribeTasks"
       ],
-      "Resource": [
-        "arn:aws:ecs:*:*:*"
-      ]
+      "Resource": "*"
     }
   ]
 }
