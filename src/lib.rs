@@ -6,8 +6,10 @@
 mod asg;
 pub mod cli;
 mod collect;
+mod ecr;
 mod ecs;
 mod elasticache;
+mod findings;
 mod logs;
 mod metrics;
 mod model;
@@ -22,17 +24,25 @@ use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_credential_types::provider::ProvideCredentials;
 use chrono::Utc;
 
-use cli::{Args, DataKind, Service};
+use cli::{Args, DataKind, Service, Severity};
 use model::{Ctx, Issues, ServiceReport, Window};
 
-/// Runs a full collection and returns the output directory.
+/// What a finished run produced.
+pub struct Snapshot {
+    /// The output directory.
+    pub root: PathBuf,
+    /// Severity of the most severe finding, if any.
+    pub worst: Option<Severity>,
+}
+
+/// Runs a full collection and returns where it was written.
 ///
 /// # Errors
 ///
 /// Fails on invalid arguments, a missing AWS region, or when the output
 /// directory cannot be written. Per-resource AWS failures are not fatal;
 /// they are recorded in the snapshot's "Collection issues".
-pub async fn run(args: Args) -> Result<PathBuf> {
+pub async fn run(args: Args) -> Result<Snapshot> {
     let window = resolve_window(&args)?;
     let metric_period = resolve_metric_period(&args, window)?;
 
@@ -71,6 +81,7 @@ pub async fn run(args: Args) -> Result<PathBuf> {
     let want_ecs = args.services.contains(&Service::Ecs);
     let asg_client = aws_sdk_autoscaling::Client::new(&config);
     let ecs_client = aws_sdk_ecs::Client::new(&config);
+    let registry_client = aws_sdk_ecr::Client::new(&config);
 
     let (rds_report, elasticache_report, asg_report, ecs_report) = tokio::join!(
         async {
@@ -96,7 +107,8 @@ pub async fn run(args: Args) -> Result<PathBuf> {
         },
         async {
             if want_ecs {
-                Some(ecs::collect(&ctx, &ecs_client).await)
+                let images = ecr::ImageChecker::new(registry_client, &region);
+                Some(ecs::collect(&ctx, &ecs_client, &images).await)
             } else {
                 None
             }
@@ -113,7 +125,8 @@ pub async fn run(args: Args) -> Result<PathBuf> {
     .filter_map(|(name, report)| Some((name, report?)))
     .collect();
 
-    report::write(&ctx, &region, &services).await?;
+    let findings = findings::evaluate(&services, &ctx.issues.snapshot());
+    report::write(&ctx, &region, &services, &findings).await?;
 
     for (name, report) in &services {
         println!(
@@ -126,7 +139,17 @@ pub async fn run(args: Args) -> Result<PathBuf> {
     if issues > 0 {
         println!("{issues} collection issue(s); see summary.md");
     }
-    Ok(ctx.root)
+    let count = |severity| findings.iter().filter(|f| f.severity == severity).count();
+    println!(
+        "findings: {} critical, {} warning, {} info",
+        count(Severity::Critical),
+        count(Severity::Warning),
+        count(Severity::Info)
+    );
+    Ok(Snapshot {
+        root: ctx.root,
+        worst: findings.first().map(|f| f.severity),
+    })
 }
 
 /// Loads AWS configuration and verifies that a region and working

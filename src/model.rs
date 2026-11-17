@@ -232,6 +232,11 @@ pub struct MetricSummary {
     /// Per-period average at the start and end of the window.
     pub first: f64,
     pub last: f64,
+    /// Start of the trailing run of periods averaging zero (or less), when
+    /// the series was above zero earlier: the metric went quiet and stayed
+    /// so, like connections to a database whose clients died.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zero_since: Option<String>,
 }
 
 /// One period of a series: `(time, avg, min, max)`.

@@ -20,8 +20,14 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let out = awstate::run(args).await?;
-    println!("snapshot written to {}", out.display());
-    println!("start with {}", out.join("summary.md").display());
+    let fail_on = args.fail_on;
+    let snapshot = awstate::run(args).await?;
+    println!("snapshot written to {}", snapshot.root.display());
+    println!("start with {}", snapshot.root.join("summary.md").display());
+    if let (Some(threshold), Some(worst)) = (fail_on, snapshot.worst)
+        && worst >= threshold
+    {
+        std::process::exit(2);
+    }
     Ok(())
 }

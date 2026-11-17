@@ -76,6 +76,11 @@ pub struct Args {
     #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]
     pub concurrency: u16,
 
+    /// Exit with status 2 when a finding at or above this severity is
+    /// raised, for alerting from scheduled runs.
+    #[arg(long, value_enum)]
+    pub fail_on: Option<Severity>,
+
     /// Verbose progress logging (repeat for more).
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
@@ -103,4 +108,16 @@ pub enum DataKind {
     Logs,
     /// Service events.
     Events,
+}
+
+/// How urgent a finding is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    /// Worth knowing; not a problem by itself.
+    Info,
+    /// Likely a problem, or one in the making.
+    Warning,
+    /// Something is broken now.
+    Critical,
 }
