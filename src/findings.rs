@@ -164,12 +164,13 @@ fn ecs_service(r: &Resource, events: &[Event], push: &mut Push) {
         })
         .collect();
     if let (Some(first), Some(last)) = (failures.first(), failures.last()) {
+        let (severity, recovery) = recovery(events, &r.id, last);
         push(
-            Severity::Warning,
+            severity,
             &r.id,
             "task-start-failures",
             format!(
-                "{} task start or placement failures between {} and {}; latest: {}",
+                "{recovery}{} task start or placement failures between {} and {}; latest: {}",
                 failures.len(),
                 first.time.as_deref().unwrap_or("?"),
                 last.time.as_deref().unwrap_or("?"),
@@ -233,17 +234,43 @@ fn ecs_stopped_tasks(events: &[Event], push: &mut Push) {
         let Some(latest) = stopped.last() else {
             continue;
         };
+        let (severity, recovery) = recovery(events, source, latest);
         push(
-            Severity::Warning,
+            severity,
             source,
             "tasks-stopped",
             format!(
-                "{} task(s) stopped recently ({}); latest: {}",
+                "{recovery}{} task(s) stopped recently ({}); latest: {}",
                 stopped.len(),
                 latest.categories.join(", "),
                 latest.message.as_deref().unwrap_or_default()
             ),
         );
+    }
+}
+
+/// Severity and message prefix for a service problem whose latest
+/// occurrence is `last`: a warning, unless the service reached a steady state
+/// afterwards, in which case it is history worth knowing but not acting on.
+fn recovery(events: &[Event], service: &str, last: &Event) -> (Severity, String) {
+    // Event times share one RFC 3339 UTC format, so they order as strings.
+    let steady = events
+        .iter()
+        .filter(|e| e.source.as_deref() == Some(service))
+        .filter(|e| {
+            e.message
+                .as_deref()
+                .is_some_and(|m| m.contains("has reached a steady state"))
+        })
+        .filter_map(|e| e.time.as_deref())
+        .filter(|t| last.time.as_deref().is_some_and(|l| *t > l))
+        .max();
+    match steady {
+        Some(t) => (
+            Severity::Info,
+            format!("recovered (steady state at {t}) after "),
+        ),
+        None => (Severity::Warning, String::new()),
     }
 }
 
@@ -604,6 +631,68 @@ mod tests {
             ]
         );
         assert!(findings[2].message.starts_with("1 task start"));
+    }
+
+    #[test]
+    fn ecs_failures_followed_by_steady_state_are_demoted_to_info() {
+        let at = |time: &str, source_type: &str, categories: &[&str], message: &str| Event {
+            time: Some(time.to_owned()),
+            source_type: Some(source_type.to_owned()),
+            source: Some("c/app".to_owned()),
+            categories: categories.iter().map(|c| (*c).to_owned()).collect(),
+            message: Some(message.to_owned()),
+        };
+        let evaluate_with_steady_at = |steady: &str| {
+            let r = resource(
+                "ecs",
+                "service",
+                "c/app",
+                json!({"desired": 1, "running": 1, "containers": [], "deployments": []}),
+            );
+            let events = vec![
+                at(
+                    steady,
+                    "ecs-service",
+                    &[],
+                    "(service app) has reached a steady state.",
+                ),
+                at(
+                    "2026-11-17T19:00:00Z",
+                    "ecs-service",
+                    &[],
+                    "(service app) was unable to place a task.",
+                ),
+                at(
+                    "2026-11-17T20:30:00Z",
+                    "ecs-task-stopped",
+                    &["TaskFailedToStart"],
+                    "x | Task failed to start",
+                ),
+            ];
+            let report = ServiceReport {
+                resources: vec![r],
+                events,
+            };
+            evaluate(&[("ecs", report)], &[])
+                .into_iter()
+                .map(|f| (f.check, f.severity, f.message.starts_with("recovered")))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            evaluate_with_steady_at("2026-11-17T20:39:04Z"),
+            [
+                ("task-start-failures", Severity::Info, true),
+                ("tasks-stopped", Severity::Info, true),
+            ]
+        );
+        assert_eq!(
+            evaluate_with_steady_at("2026-11-17T18:00:00Z"),
+            [
+                ("task-start-failures", Severity::Warning, false),
+                ("tasks-stopped", Severity::Warning, false),
+            ]
+        );
     }
 
     #[test]
