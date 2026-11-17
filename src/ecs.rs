@@ -10,6 +10,7 @@ use futures::{StreamExt, stream};
 use serde_json::{Value, json};
 
 use crate::collect::collect_all;
+use crate::ecr::{ImageChecker, ImageStatus};
 use crate::model::{Ctx, Event, LogSource, MetricSource, ServiceReport, Spec, iso};
 
 const SERVICE: &str = "ecs";
@@ -21,7 +22,7 @@ const DESCRIBE_BATCH: usize = 100;
 const DESCRIBE_SERVICES_BATCH: usize = 10;
 
 /// Collects inventory, metrics, logs, and events for ECS.
-pub async fn collect(ctx: &Ctx, client: &Client) -> ServiceReport {
+pub async fn collect(ctx: &Ctx, client: &Client, images: &ImageChecker) -> ServiceReport {
     let clusters = list_clusters(client).await.unwrap_or_else(|err| {
         ctx.issues.record("ecs clusters inventory", &err);
         Vec::new()
@@ -50,7 +51,7 @@ pub async fn collect(ctx: &Ctx, client: &Client) -> ServiceReport {
                     events.extend(wanted.iter().flat_map(|s| service_events(ctx, name, s)));
                 }
                 let service_specs: Vec<Spec> = stream::iter(wanted)
-                    .map(|service| service_spec(ctx, client, name, service))
+                    .map(|service| service_spec(ctx, client, images, name, service))
                     .buffer_unordered(ctx.concurrency)
                     .collect()
                     .await;
@@ -175,7 +176,13 @@ fn cluster_spec(c: &Cluster, name: &str) -> Spec {
     }
 }
 
-async fn service_spec(ctx: &Ctx, client: &Client, cluster: &str, s: &Service) -> Spec {
+async fn service_spec(
+    ctx: &Ctx,
+    client: &Client,
+    images: &ImageChecker,
+    cluster: &str,
+    s: &Service,
+) -> Spec {
     let name = s.service_name().unwrap_or_default();
     let id = format!("{cluster}/{name}");
     let mut notes = Vec::new();
@@ -191,9 +198,10 @@ async fn service_spec(ctx: &Ctx, client: &Client, cluster: &str, s: &Service) ->
         },
         None => None,
     };
-    let (containers, log_sources) = task_definition
+    let (mut containers, log_sources) = task_definition
         .as_ref()
         .map_or_default(|d| containers(d, &mut notes));
+    check_images(ctx, images, &mut containers, &mut notes).await;
 
     let deployments: Vec<_> = s
         .deployments()
@@ -277,6 +285,29 @@ async fn service_spec(ctx: &Ctx, client: &Client, cluster: &str, s: &Service) ->
         details,
         log_sources,
         notes,
+    }
+}
+
+/// Adds `image_status` to each container and a note for every image the
+/// service could not pull when it next starts a task.
+async fn check_images(
+    ctx: &Ctx,
+    images: &ImageChecker,
+    containers: &mut [Value],
+    notes: &mut Vec<String>,
+) {
+    for container in containers {
+        let Some(image) = container["image"].as_str().map(str::to_owned) else {
+            continue;
+        };
+        let status = images.check(ctx, &image).await;
+        if status == ImageStatus::Missing {
+            notes.push(format!(
+                "container {} image {image} no longer exists in ECR; new tasks cannot start",
+                container["name"].as_str().unwrap_or_default()
+            ));
+        }
+        container["image_status"] = json!(status);
     }
 }
 

@@ -1,16 +1,22 @@
-//! Final output: `manifest.json`, per-service `events.json`, and the
-//! `summary.md` digest meant to be read first by a human or a model.
+//! Final output: `manifest.json`, `findings.json`, per-service
+//! `events.json`, and the `summary.md` digest meant to be read first by a human or a model.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use anyhow::Result;
 use serde::Serialize;
 
+use crate::cli::Severity;
 use crate::collect::{write_file, write_json};
+use crate::findings::Finding;
 use crate::model::{Ctx, Event, Issue, MetricHead, Resource, ServiceReport, Window, iso_chrono};
 
-/// Events listed per service in `summary.md`; the JSON file has all of them.
+/// Event groups listed per service in `summary.md`; the JSON file has all
+/// events.
 const SUMMARY_EVENT_LIMIT: usize = 300;
+
+const FINDINGS_FILE: &str = "findings.json";
 
 #[derive(Serialize)]
 struct Manifest<'a> {
@@ -20,6 +26,8 @@ struct Manifest<'a> {
     region: &'a str,
     window: Window,
     metric_period_seconds: i32,
+    findings_file: &'static str,
+    finding_count: usize,
     services: Vec<ServiceManifest<'a>>,
     issues: &'a [Issue],
 }
@@ -34,8 +42,14 @@ struct ServiceManifest<'a> {
 }
 
 /// Writes the manifest, event files, and summary for all services.
-pub async fn write(ctx: &Ctx, region: &str, services: &[(&str, ServiceReport)]) -> Result<()> {
+pub async fn write(
+    ctx: &Ctx,
+    region: &str,
+    services: &[(&str, ServiceReport)],
+    findings: &[Finding],
+) -> Result<()> {
     let issues = ctx.issues.snapshot();
+    write_json(ctx, FINDINGS_FILE, findings).await?;
 
     let mut manifests = Vec::with_capacity(services.len());
     for (name, report) in services {
@@ -61,12 +75,14 @@ pub async fn write(ctx: &Ctx, region: &str, services: &[(&str, ServiceReport)]) 
         region,
         window: ctx.window,
         metric_period_seconds: ctx.metric_period,
+        findings_file: FINDINGS_FILE,
+        finding_count: findings.len(),
         services: manifests,
         issues: &issues,
     };
     write_json(ctx, "manifest.json", &manifest).await?;
 
-    let summary = render_summary(ctx, region, services, &issues);
+    let summary = render_summary(ctx, region, services, findings, &issues);
     write_file(ctx, "summary.md", summary.as_bytes()).await
 }
 
@@ -75,6 +91,7 @@ fn render_summary(
     ctx: &Ctx,
     region: &str,
     services: &[(&str, ServiceReport)],
+    findings: &[Finding],
     issues: &[Issue],
 ) -> String {
     let mut md = String::new();
@@ -98,6 +115,7 @@ fn render_summary(
          - Full time series are in each resource's `metrics.json`; complete resource details \
          and file paths are in `manifest.json`; all paths are relative to this directory.\n",
     );
+    render_findings(&mut md, findings);
 
     for (name, report) in services {
         let _ = writeln!(md, "\n## {name}\n");
@@ -117,6 +135,34 @@ fn render_summary(
         }
     }
     md
+}
+
+fn render_findings(md: &mut String, findings: &[Finding]) {
+    md.push_str("\n## Findings\n\n");
+    if findings.is_empty() {
+        md.push_str("No checks raised anything.\n");
+        return;
+    }
+    md.push_str(
+        "Automated checks over the data below, most severe first (also in `findings.json`). \
+         They point at where to look; they are not a full analysis.\n\n\
+         | severity | service | resource | check | finding |\n|---|---|---|---|---|\n",
+    );
+    for f in findings {
+        let severity = match f.severity {
+            Severity::Critical => "**critical**",
+            Severity::Warning => "warning",
+            Severity::Info => "info",
+        };
+        let _ = writeln!(
+            md,
+            "| {severity} | {} | {} | {} | {} |",
+            f.service,
+            cell(&f.resource),
+            f.check,
+            cell(&f.message)
+        );
+    }
 }
 
 fn render_resource(md: &mut String, r: &Resource) {
@@ -185,13 +231,19 @@ fn render_events(md: &mut String, service: &str, events: &[Event], enabled: bool
         md.push_str("No events in the window.\n");
         return;
     }
+    let groups = group_events(events);
     let _ = writeln!(
         md,
-        "{} events (all in `{service}/events.json`).\n",
-        events.len()
+        "{} events in {} groups (all events in `{service}/events.json`). Events that differ \
+         only in ids, numbers, and times are grouped; `message` is the latest occurrence.\n",
+        events.len(),
+        groups.len()
     );
-    md.push_str("| time | source | categories | message |\n|---|---|---|---|\n");
-    for e in events.iter().take(SUMMARY_EVENT_LIMIT) {
+    md.push_str(
+        "| first | last | count | source | categories | message |\n|---|---|---|---|---|---|\n",
+    );
+    for g in groups.iter().take(SUMMARY_EVENT_LIMIT) {
+        let e = g.latest;
         let source = match (&e.source_type, &e.source) {
             (Some(t), Some(s)) => format!("{t} {s}"),
             (None, Some(s)) => s.clone(),
@@ -200,20 +252,84 @@ fn render_events(md: &mut String, service: &str, events: &[Event], enabled: bool
         };
         let _ = writeln!(
             md,
-            "| {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} |",
+            g.first.unwrap_or_default(),
             e.time.as_deref().unwrap_or_default(),
+            g.count,
             cell(&source),
             cell(&e.categories.join(", ")),
             cell(e.message.as_deref().unwrap_or_default()),
         );
     }
-    if events.len() > SUMMARY_EVENT_LIMIT {
+    if groups.len() > SUMMARY_EVENT_LIMIT {
         let _ = writeln!(
             md,
-            "\n{} more events omitted here.",
-            events.len() - SUMMARY_EVENT_LIMIT
+            "\n{} more groups omitted here.",
+            groups.len() - SUMMARY_EVENT_LIMIT
         );
     }
+}
+
+/// Events sharing a source, categories, and message template.
+struct EventGroup<'a> {
+    first: Option<&'a str>,
+    latest: &'a Event,
+    count: usize,
+}
+
+/// Source type, source, categories, and message template.
+type GroupKey<'a> = (&'a Option<String>, &'a Option<String>, &'a [String], String);
+
+/// Groups events by [`template`], ordered by first occurrence. `events`
+/// must be sorted by time.
+fn group_events(events: &[Event]) -> Vec<EventGroup<'_>> {
+    let mut index: HashMap<GroupKey, usize> = HashMap::new();
+    let mut groups: Vec<EventGroup> = Vec::new();
+    for e in events {
+        let key = (
+            &e.source_type,
+            &e.source,
+            e.categories.as_slice(),
+            template(e.message.as_deref().unwrap_or_default()),
+        );
+        if let Some(&i) = index.get(&key) {
+            groups[i].latest = e;
+            groups[i].count += 1;
+        } else {
+            index.insert(key, groups.len());
+            groups.push(EventGroup {
+                first: e.time.as_deref(),
+                latest: e,
+                count: 1,
+            });
+        }
+    }
+    groups
+}
+
+/// A message with every alphanumeric run that contains a digit replaced by
+/// `#`, so instance ids, task ids, counts, and timestamps compare equal.
+fn template(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        if run.bytes().any(|b| b.is_ascii_digit()) {
+            out.push('#');
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    };
+    for c in message.chars() {
+        if c.is_ascii_alphanumeric() {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
 }
 
 /// Dimensions other than those naming the resource itself (identifiers
@@ -276,6 +392,41 @@ mod tests {
         assert_eq!(fmt_num(15_000.0), "15k");
         assert_eq!(fmt_num(2_500_000_000.0), "2.5G");
         assert_eq!(fmt_num(-7_300_000.0), "-7.3M");
+    }
+
+    #[test]
+    fn template_masks_ids_and_numbers() {
+        assert_eq!(
+            template("Terminating EC2 instance: i-09028f1ed00963261 at 2026-11-11T08:01:29Z"),
+            "Terminating # instance: i-# at #-#-#:#:#"
+        );
+        assert_eq!(
+            template("(service app) reached a steady state."),
+            "(service app) reached a steady state."
+        );
+    }
+
+    #[test]
+    fn group_events_counts_repeats_in_first_seen_order() {
+        let event = |time: &str, source: &str, message: &str| Event {
+            time: Some(time.to_owned()),
+            source_type: None,
+            source: Some(source.to_owned()),
+            categories: Vec::new(),
+            message: Some(message.to_owned()),
+        };
+        let events = [
+            event("t1", "a", "started 1 tasks: (task 1f2e)"),
+            event("t2", "b", "started 1 tasks: (task 9a8b)"),
+            event("t3", "a", "started 2 tasks: (task 3c4d)"),
+            event("t4", "a", "reached a steady state."),
+        ];
+        let groups = group_events(&events);
+        assert_eq!(groups.len(), 3);
+        assert_eq!((groups[0].first, groups[0].count), (Some("t1"), 2));
+        assert_eq!(groups[0].latest.time.as_deref(), Some("t3"));
+        assert_eq!(groups[1].count, 1);
+        assert_eq!(groups[2].first, Some("t4"));
     }
 
     #[test]

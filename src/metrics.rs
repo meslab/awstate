@@ -183,7 +183,20 @@ fn summarize(points: &Points) -> Option<MetricSummary> {
         p95: percentile(&sorted, 95),
         first,
         last,
+        zero_since: zero_since(points),
     })
+}
+
+/// See [`MetricSummary::zero_since`].
+fn zero_since(points: &Points) -> Option<String> {
+    let mut since = None;
+    for (ts, avg) in points.iter().rev().filter_map(|(ts, p)| Some((*ts, p[0]?))) {
+        if avg > 0.0 {
+            return since.map(iso_secs);
+        }
+        since = Some(ts);
+    }
+    None
 }
 
 /// Nearest-rank percentile of an ascending, non-empty slice.
@@ -227,6 +240,24 @@ mod tests {
         assert_eq!(s.max_at, "1970-01-01T00:05:00Z");
         assert!((s.first - 1.0).abs() < 1e-9);
         assert!((s.last - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zero_since_marks_a_trailing_flatline_after_activity() {
+        let series = |avgs: &[f64]| -> Points {
+            (0..)
+                .step_by(300)
+                .zip(avgs)
+                .map(|(ts, a)| (ts, [Some(*a), None, None]))
+                .collect()
+        };
+        assert_eq!(
+            zero_since(&series(&[3.0, 0.0, 5.0, 0.0, 0.0])).as_deref(),
+            Some("1970-01-01T00:15:00Z")
+        );
+        assert_eq!(zero_since(&series(&[3.0, 0.0, 5.0])), None);
+        assert_eq!(zero_since(&series(&[0.0, 0.0])), None);
+        assert_eq!(zero_since(&series(&[-1.0, -1.0])), None);
     }
 
     #[test]
