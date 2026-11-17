@@ -1,0 +1,93 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CloudWatchMetrics",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:ListMetrics",
+        "cloudwatch:GetMetricData"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CloudWatchLogs",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatchlogs:FilterLogEvents"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "RdsRead",
+      "Effect": "Allow",
+      "Action": [
+        "rds:DescribeDBInstances",
+        "rds:DescribeDBClusters",
+        "rds:DescribeDBLogFiles",
+        "rds:DownloadDBLogFilePortion"
+      ],
+      "Resource": [
+        "arn:aws:rds:*:*:db:*",
+        "arn:aws:rds:*:*:cluster:*",
+        "arn:aws:rds:*:*:log:*"
+      ]
+    },
+    {
+      "Sid": "RdsEvents",
+      "Effect": "Allow",
+      "Action": [
+        "rds:DescribeEvents"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ElastiCacheRead",
+      "Effect": "Allow",
+      "Action": [
+        "elasticache:DescribeCacheClusters",
+        "elasticache:DescribeReplicationGroups",
+        "elasticache:DescribeServerlessCaches"
+      ],
+      "Resource": [
+        "arn:aws:elasticache:*:*:cluster:*",
+        "arn:aws:elasticache:*:*:replication-group:*"
+      ]
+    },
+    {
+      "Sid": "ElastiCacheEvents",
+      "Effect": "Allow",
+      "Action": [
+        "elasticache:DescribeEvents"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AutoScalingRead",
+      "Effect": "Allow",
+      "Action": [
+        "autoscaling:DescribeAutoScalingGroups",
+        "autoscaling:DescribeScalingActivities"
+      ],
+      "Resource": [
+        "arn:aws:autoscaling:*:*:autoScalingGroup/*:autoScalingGroupName/*"
+      ]
+    },
+    {
+      "Sid": "EcsRead",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:ListClusters",
+        "ecs:DescribeClusters",
+        "ecs:ListServices",
+        "ecs:DescribeServices",
+        "ecs:DescribeTaskDefinition",
+        "ecs:ListTasks",
+        "ecs:DescribeTasks"
+      ],
+      "Resource": [
+        "arn:aws:ecs:*:*:*"
+      ]
+    }
+  ]
+}
