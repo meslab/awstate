@@ -136,7 +136,8 @@ async fn collect_services(
     let want_ecs = args.services.contains(&Service::Ecs);
     let asg_client = aws_sdk_autoscaling::Client::new(config);
     let ecs_client = aws_sdk_ecs::Client::new(config);
-    let registry_client = aws_sdk_ecr::Client::new(config);
+    let images = (!args.skip.contains(&DataKind::Images))
+        .then(|| ecr::ImageChecker::new(aws_sdk_ecr::Client::new(config), region));
 
     let want_alb = args.services.contains(&Service::Alb);
     let want_cloudfront = args.services.contains(&Service::Cloudfront);
@@ -169,8 +170,7 @@ async fn collect_services(
         },
         async {
             if want_ecs {
-                let images = ecr::ImageChecker::new(registry_client, region);
-                Some(ecs::collect(ctx, &ecs_client, &images).await)
+                Some(ecs::collect(ctx, &ecs_client, images.as_ref()).await)
             } else {
                 None
             }

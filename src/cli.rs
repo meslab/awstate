@@ -131,6 +131,8 @@ pub enum DataKind {
     Logs,
     /// Service events, and configuration changes from CloudTrail.
     Events,
+    /// ECR lookups of the images ECS task definitions reference.
+    Images,
 }
 
 /// How urgent a finding is.

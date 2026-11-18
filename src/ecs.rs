@@ -22,7 +22,7 @@ const DESCRIBE_BATCH: usize = 100;
 const DESCRIBE_SERVICES_BATCH: usize = 10;
 
 /// Collects inventory, metrics, logs, and events for ECS.
-pub async fn collect(ctx: &Ctx, client: &Client, images: &ImageChecker) -> ServiceReport {
+pub async fn collect(ctx: &Ctx, client: &Client, images: Option<&ImageChecker>) -> ServiceReport {
     let clusters = list_clusters(client).await.unwrap_or_else(|err| {
         ctx.issues.record("ecs clusters inventory", &err);
         Vec::new()
@@ -180,7 +180,7 @@ fn cluster_spec(c: &Cluster, name: &str) -> Spec {
 async fn service_spec(
     ctx: &Ctx,
     client: &Client,
-    images: &ImageChecker,
+    images: Option<&ImageChecker>,
     cluster: &str,
     s: &Service,
 ) -> Spec {
@@ -294,10 +294,13 @@ async fn service_spec(
 /// service could not pull when it next starts a task.
 async fn check_images(
     ctx: &Ctx,
-    images: &ImageChecker,
+    images: Option<&ImageChecker>,
     containers: &mut [Value],
     notes: &mut Vec<String>,
 ) {
+    let Some(images) = images else {
+        return;
+    };
     for container in containers {
         let Some(image) = container["image"].as_str().map(str::to_owned) else {
             continue;
