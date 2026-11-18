@@ -13,7 +13,15 @@ use crate::model::{Ctx, MetricHead, MetricSeries, MetricSource, MetricSummary, i
 
 /// Statistics requested per metric, with their query-id suffix and the
 /// column they fill.
-const STATS: [(&str, &str); 3] = [("Average", "a"), ("Minimum", "n"), ("Maximum", "x")];
+const STATS: [(&str, &str, usize); 3] = [
+    ("Average", "a", 0),
+    ("Minimum", "n", 1),
+    ("Maximum", "x", 2),
+];
+
+/// The statistic requested for summed metrics. It fills the first column,
+/// so the summary describes per-period sums.
+const SUM_STATS: [(&str, &str, usize); 1] = [("Sum", "s", 0)];
 
 /// `GetMetricData` accepts at most 500 queries per request.
 const METRICS_PER_REQUEST: usize = 500 / STATS.len();
@@ -24,9 +32,20 @@ pub async fn collect(ctx: &Ctx, source: &MetricSource) -> Result<Vec<MetricSerie
     let metrics = discover(ctx, source).await?;
     let mut out = Vec::with_capacity(metrics.len());
     for chunk in metrics.chunks(METRICS_PER_REQUEST) {
-        out.extend(fetch(ctx, chunk).await?);
+        out.extend(fetch(ctx, source, chunk).await?);
     }
     Ok(out)
+}
+
+fn stats_for(
+    source: &MetricSource,
+    metric: &Metric,
+) -> &'static [(&'static str, &'static str, usize)] {
+    if source.is_summed(metric.metric_name().unwrap_or_default()) {
+        &SUM_STATS
+    } else {
+        &STATS
+    }
 }
 
 async fn discover(ctx: &Ctx, source: &MetricSource) -> Result<Vec<Metric>> {
@@ -43,7 +62,7 @@ async fn discover(ctx: &Ctx, source: &MetricSource) -> Result<Vec<Metric>> {
         .collect::<Vec<_>>()
         .join("/");
     let mut pages = ctx
-        .cw
+        .cw_for(source.us_east_1)
         .list_metrics()
         .namespace(namespace)
         .set_dimensions(Some(filters))
@@ -63,10 +82,10 @@ async fn discover(ctx: &Ctx, source: &MetricSource) -> Result<Vec<Metric>> {
 /// Per-timestamp `[avg, min, max]`, keyed by epoch seconds.
 type Points = BTreeMap<i64, [Option<f64>; 3]>;
 
-async fn fetch(ctx: &Ctx, metrics: &[Metric]) -> Result<Vec<MetricSeries>> {
+async fn fetch(ctx: &Ctx, source: &MetricSource, metrics: &[Metric]) -> Result<Vec<MetricSeries>> {
     let mut queries = Vec::with_capacity(metrics.len() * STATS.len());
     for (idx, metric) in metrics.iter().enumerate() {
-        for (stat, suffix) in STATS {
+        for &(stat, suffix, _) in stats_for(source, metric) {
             let metric_stat = MetricStat::builder()
                 .metric(metric.clone())
                 .period(ctx.metric_period)
@@ -83,7 +102,7 @@ async fn fetch(ctx: &Ctx, metrics: &[Metric]) -> Result<Vec<MetricSeries>> {
     }
 
     let mut pages = ctx
-        .cw
+        .cw_for(source.us_east_1)
         .get_metric_data()
         .start_time(ctx.window.aws_start())
         .end_time(ctx.window.aws_end())
@@ -111,7 +130,12 @@ async fn fetch(ctx: &Ctx, metrics: &[Metric]) -> Result<Vec<MetricSeries>> {
     Ok(metrics
         .iter()
         .zip(points)
-        .filter_map(|(metric, points)| build_series(metric, &points, ctx.metric_period))
+        .filter_map(|(metric, points)| {
+            let statistic = source
+                .is_summed(metric.metric_name().unwrap_or_default())
+                .then_some("Sum");
+            build_series(metric, &points, ctx.metric_period, statistic)
+        })
         .collect())
 }
 
@@ -120,12 +144,24 @@ fn parse_query_id(id: &str) -> Option<(usize, usize)> {
     let body = id.strip_prefix('m')?;
     let split = body.len().checked_sub(1)?;
     let (idx, suffix) = body.split_at_checked(split)?;
-    let column = STATS.iter().position(|(_, s)| *s == suffix)?;
+    let column = STATS
+        .iter()
+        .chain(&SUM_STATS)
+        .find(|(_, s, _)| *s == suffix)?
+        .2;
     Some((idx.parse().ok()?, column))
 }
 
-fn build_series(metric: &Metric, points: &Points, period: i32) -> Option<MetricSeries> {
-    let summary = summarize(points)?;
+fn build_series(
+    metric: &Metric,
+    points: &Points,
+    period: i32,
+    statistic: Option<&'static str>,
+) -> Option<MetricSeries> {
+    let mut summary = summarize(points)?;
+    if statistic.is_some() {
+        summary.total = Some(points.values().filter_map(|p| p[0]).sum());
+    }
     let dimensions = metric
         .dimensions()
         .iter()
@@ -140,10 +176,15 @@ fn build_series(metric: &Metric, points: &Points, period: i32) -> Option<MetricS
             namespace: metric.namespace().unwrap_or_default().to_owned(),
             name: metric.metric_name().unwrap_or_default().to_owned(),
             dimensions,
+            statistic,
             summary,
         },
         period_seconds: period,
-        columns: ["time", "avg", "min", "max"],
+        columns: if statistic.is_some() {
+            ["time", "sum", "min", "max"]
+        } else {
+            ["time", "avg", "min", "max"]
+        },
         rows,
     })
 }
@@ -184,6 +225,7 @@ fn summarize(points: &Points) -> Option<MetricSummary> {
         first,
         last,
         zero_since: zero_since(points),
+        total: None,
     })
 }
 
@@ -213,6 +255,7 @@ mod tests {
     fn query_ids_round_trip() {
         assert_eq!(parse_query_id("m0a"), Some((0, 0)));
         assert_eq!(parse_query_id("m137x"), Some((137, 2)));
+        assert_eq!(parse_query_id("m4s"), Some((4, 0)));
         assert_eq!(parse_query_id("m"), None);
         assert_eq!(parse_query_id("m5z"), None);
         assert_eq!(parse_query_id("x5a"), None);

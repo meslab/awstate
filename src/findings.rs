@@ -24,6 +24,15 @@ const STORAGE_CRITICAL_FRACTION: f64 = 0.05;
 const SWAP_P95_BYTES: f64 = 200e6;
 /// Memory used by an `ElastiCache` node beyond this (max, percent).
 const CACHE_MEMORY_PERCENT: f64 = 90.0;
+/// Share of requests answered with 5xx at or beyond which a load balancer
+/// finding is a warning rather than info.
+const HTTP_5XX_WARN_FRACTION: f64 = 0.01;
+/// `CloudFront` 5xx error rate (p95 of per-period averages, percent) that
+/// is flagged as sustained, and the peak that is flagged as a spike.
+const CDN_5XX_P95_PERCENT: f64 = 1.0;
+const CDN_5XX_PEAK_PERCENT: f64 = 5.0;
+/// `CloudFront` 4xx error rate (p95, percent) worth knowing about.
+const CDN_4XX_P95_PERCENT: f64 = 10.0;
 /// RDS event categories that mean something went wrong.
 const RDS_TROUBLE_CATEGORIES: [&str; 4] = ["failover", "failure", "low storage", "recovery"];
 
@@ -59,6 +68,8 @@ pub fn evaluate(services: &[(&str, ServiceReport)], issues: &[Issue]) -> Vec<Fin
                 ("rds", _) => rds(r, &mut push),
                 ("elasticache", _) => elasticache(r, &mut push),
                 ("asg", _) => asg(r, &report.events, &mut push),
+                ("alb", _) => alb(r, &mut push),
+                ("cloudfront", _) => cloudfront(r, &mut push),
                 _ => {}
             }
         }
@@ -503,6 +514,192 @@ fn asg(r: &Resource, events: &[Event], push: &mut Push) {
     }
 }
 
+fn alb(r: &Resource, push: &mut Push) {
+    let d = &r.details;
+    if let Some(state) = d["state"].as_str()
+        && state != "active"
+    {
+        let reason = d["state_reason"].as_str().unwrap_or_default();
+        push(
+            Severity::Warning,
+            &r.id,
+            "status",
+            format!("state is {state} {reason}").trim_end().to_owned(),
+        );
+    }
+    alb_target_groups(r, push);
+    alb_errors(r, push);
+}
+
+fn alb_target_groups(r: &Resource, push: &mut Push) {
+    let d = &r.details;
+    let forwarded_to: Vec<&str> = array(&d["listeners"])
+        .iter()
+        .flat_map(|l| array(&l["default_actions"]))
+        .filter_map(|a| a["target_group"].as_str())
+        .collect();
+    for tg in array(&d["target_groups"]) {
+        let name = tg["name"].as_str().unwrap_or("?");
+        let targets = array(&tg["targets"]);
+        let healthy = tg["healthy"].as_u64().unwrap_or(0);
+        let unhealthy: Vec<&Value> = targets
+            .iter()
+            .filter(|t| t["state"] == "unhealthy")
+            .collect();
+        if let Some(first) = unhealthy.first() {
+            let severity = if healthy == 0 {
+                Severity::Critical
+            } else {
+                Severity::Warning
+            };
+            push(
+                severity,
+                &r.id,
+                "targets-unhealthy",
+                format!(
+                    "target group {name}: {} unhealthy, {healthy} healthy at collection time;                      e.g. {} {}",
+                    unhealthy.len(),
+                    first["id"].as_str().unwrap_or("?"),
+                    first["description"].as_str().unwrap_or_default()
+                ),
+            );
+        } else if targets.is_empty() && forwarded_to.contains(&name) {
+            push(
+                Severity::Warning,
+                &r.id,
+                "target-group-empty",
+                format!("listener default target group {name} has no registered targets"),
+            );
+        }
+    }
+}
+
+/// 5xx responses and connection failures, from the window's metrics.
+fn alb_errors(r: &Resource, push: &mut Push) {
+    let requests = metric(r, "RequestCount").and_then(|m| m.total);
+    for (name, check, what) in [
+        ("HTTPCode_ELB_5XX_Count", "elb-5xx", "load balancer"),
+        ("HTTPCode_Target_5XX_Count", "target-5xx", "target"),
+    ] {
+        let Some(errors) = metric(r, name) else {
+            continue;
+        };
+        let total = errors.total.unwrap_or(0.0);
+        if total <= 0.0 {
+            continue;
+        }
+        let share = requests.filter(|r| *r > 0.0).map(|r| total / r);
+        let severity = if share.is_none_or(|s| s >= HTTP_5XX_WARN_FRACTION) {
+            Severity::Warning
+        } else {
+            Severity::Info
+        };
+        let of_requests = share.map_or_else(String::new, |s| {
+            format!(
+                " ({:.2}% of {:.0} requests)",
+                s * 100.0,
+                requests.unwrap_or(0.0)
+            )
+        });
+        push(
+            severity,
+            &r.id,
+            check,
+            format!(
+                "{total:.0} {what} 5xx responses{of_requests}; peak {:.0} per period at {}",
+                errors.max, errors.max_at
+            ),
+        );
+    }
+
+    for (name, check, what) in [
+        (
+            "RejectedConnectionCount",
+            "connections-rejected",
+            "connections rejected because the load balancer reached its connection limit",
+        ),
+        (
+            "TargetConnectionErrorCount",
+            "target-connection-errors",
+            "failed connections to targets",
+        ),
+    ] {
+        if let Some(m) = metric(r, name)
+            && m.total.is_some_and(|t| t > 0.0)
+        {
+            push(
+                Severity::Warning,
+                &r.id,
+                check,
+                format!(
+                    "{:.0} {what}; peak {:.0} per period at {}",
+                    m.total.unwrap_or(0.0),
+                    m.max,
+                    m.max_at
+                ),
+            );
+        }
+    }
+}
+
+fn cloudfront(r: &Resource, push: &mut Push) {
+    let d = &r.details;
+    if d["enabled"] == false {
+        push(
+            Severity::Info,
+            &r.id,
+            "disabled",
+            "distribution is disabled".to_owned(),
+        );
+    }
+    if let Some(status) = d["status"].as_str()
+        && status != "Deployed"
+    {
+        push(
+            Severity::Info,
+            &r.id,
+            "status",
+            format!("status is {status}; a configuration change is still propagating"),
+        );
+    }
+    if let Some(rate) = metric(r, "5xxErrorRate") {
+        if rate.p95 >= CDN_5XX_P95_PERCENT {
+            push(
+                Severity::Warning,
+                &r.id,
+                "error-rate-5xx",
+                format!(
+                    "5xx error rate p95 {:.1}% (avg {:.2}%, max {:.1}% at {})",
+                    rate.p95, rate.avg, rate.max, rate.max_at
+                ),
+            );
+        } else if rate.max >= CDN_5XX_PEAK_PERCENT {
+            push(
+                Severity::Info,
+                &r.id,
+                "error-rate-5xx",
+                format!(
+                    "5xx error rate spiked to {:.1}% at {}",
+                    rate.max, rate.max_at
+                ),
+            );
+        }
+    }
+    if let Some(rate) = metric(r, "4xxErrorRate")
+        && rate.p95 >= CDN_4XX_P95_PERCENT
+    {
+        push(
+            Severity::Info,
+            &r.id,
+            "error-rate-4xx",
+            format!(
+                "4xx error rate p95 {:.1}% (max {:.1}% at {})",
+                rate.p95, rate.max, rate.max_at
+            ),
+        );
+    }
+}
+
 /// The resource's own metric by name: the one with the fewest extra
 /// dimensions, so `DBLoad` beats `DBLoad` split by insights mode.
 fn metric<'a>(r: &'a Resource, name: &str) -> Option<&'a MetricSummary> {
@@ -545,6 +742,7 @@ mod tests {
             first: avg,
             last: avg,
             zero_since: None,
+            total: None,
         }
     }
 
@@ -566,6 +764,7 @@ mod tests {
             namespace: "AWS/X".to_owned(),
             name: name.to_owned(),
             dimensions: BTreeMap::new(),
+            statistic: None,
             summary: s,
         });
         r
@@ -751,6 +950,76 @@ mod tests {
         assert_eq!(
             checks("asg", vec![r], events),
             ["scaling-failed", "spot-interruptions"]
+        );
+    }
+
+    #[test]
+    fn alb_flags_unhealthy_targets_and_5xx_share() {
+        let r = resource(
+            "alb",
+            "load-balancer",
+            "web",
+            json!({
+                "state": "active",
+                "listeners": [{"default_actions": [{"target_group": "empty"}]}],
+                "target_groups": [
+                    {"name": "api", "healthy": 0, "targets": [
+                        {"id": "10.0.0.1", "state": "unhealthy", "description": "Health checks failed"}
+                    ]},
+                    {"name": "empty", "healthy": 0, "targets": []},
+                    {"name": "unused", "healthy": 0, "targets": []},
+                ],
+            }),
+        );
+        let total = |t: f64| {
+            let mut s = summary(1.0, 0.0, 5.0, 2.0);
+            s.total = Some(t);
+            s
+        };
+        let r = with_metric(r, "RequestCount", total(10_000.0));
+        let r = with_metric(r, "HTTPCode_ELB_5XX_Count", total(5.0));
+        let r = with_metric(r, "HTTPCode_Target_5XX_Count", total(500.0));
+        let r = with_metric(r, "RejectedConnectionCount", total(0.0));
+        let findings = evaluate(
+            &[(
+                "alb",
+                ServiceReport {
+                    resources: vec![r],
+                    events: Vec::new(),
+                },
+            )],
+            &[],
+        );
+        let got: Vec<_> = findings.iter().map(|f| (f.severity, f.check)).collect();
+        assert_eq!(
+            got,
+            [
+                (Severity::Critical, "targets-unhealthy"),
+                (Severity::Warning, "target-5xx"),
+                (Severity::Warning, "target-group-empty"),
+                (Severity::Info, "elb-5xx"),
+            ]
+        );
+        assert!(
+            findings[1]
+                .message
+                .starts_with("500 target 5xx responses (5.00% of 10000")
+        );
+    }
+
+    #[test]
+    fn cloudfront_flags_sustained_5xx_and_propagation() {
+        let r = resource(
+            "cloudfront",
+            "distribution",
+            "E2ABC",
+            json!({"enabled": true, "status": "InProgress"}),
+        );
+        let r = with_metric(r, "5xxErrorRate", summary(0.8, 0.0, 12.0, 2.5));
+        let r = with_metric(r, "4xxErrorRate", summary(1.0, 0.0, 3.0, 2.0));
+        assert_eq!(
+            checks("cloudfront", vec![r], Vec::new()),
+            ["error-rate-5xx", "status"]
         );
     }
 
