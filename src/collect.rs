@@ -73,6 +73,17 @@ pub async fn collect_one(ctx: &Ctx, spec: Spec) -> Resource {
         }
     }
 
+    if ctx.logs_enabled && ctx.max_access_log_bytes > 0 {
+        for source in &spec.access_log_sources {
+            match ctx.access_logs.capture(ctx, source, &rel_dir).await {
+                Ok(capture) => resource.logs.push(capture),
+                Err(err) => ctx
+                    .issues
+                    .record(format!("{scope} access logs {}", source.label), &err),
+            }
+        }
+    }
+
     resource
 }
 

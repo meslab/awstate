@@ -142,6 +142,7 @@ fn group_spec(g: &AutoScalingGroup) -> Spec {
             .into_iter()
             .map(|namespace| MetricSource::by(namespace, DIMENSION, name))
             .collect(),
+        access_log_sources: Vec::new(),
         log_sources: Vec::new(),
         notes,
     }

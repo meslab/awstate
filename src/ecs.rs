@@ -171,6 +171,7 @@ fn cluster_spec(c: &Cluster, name: &str) -> Spec {
         id: name.to_owned(),
         details,
         metric_sources: metric_sources(&[("ClusterName", name)]),
+        access_log_sources: Vec::new(),
         log_sources: Vec::new(),
         notes: Vec::new(),
     }
@@ -283,6 +284,7 @@ async fn service_spec(
         metric_sources: metric_sources(&[("ClusterName", cluster), ("ServiceName", name)]),
         id,
         details,
+        access_log_sources: Vec::new(),
         log_sources,
         notes,
     }
@@ -364,6 +366,7 @@ fn containers(
             stream_prefix: options
                 .and_then(|o| o.get("awslogs-stream-prefix"))
                 .map(|prefix| format!("{prefix}/{name}/")),
+            us_east_1: false,
         };
         if !sources.contains(&source) {
             sources.push(source);

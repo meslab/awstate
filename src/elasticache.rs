@@ -181,6 +181,7 @@ fn cache_cluster_spec(c: &CacheCluster) -> Spec {
             "CacheClusterId",
             c.cache_cluster_id().unwrap_or_default(),
         )],
+        access_log_sources: Vec::new(),
         log_sources: log_groups.into_iter().map(LogSource::from).collect(),
         notes,
     }
@@ -237,6 +238,7 @@ fn replication_group_spec(g: &ReplicationGroup) -> Spec {
         id: g.replication_group_id().unwrap_or_default().to_owned(),
         details,
         metric_sources: Vec::new(),
+        access_log_sources: Vec::new(),
         log_sources: log_groups.into_iter().map(LogSource::from).collect(),
         notes,
     }
@@ -270,6 +272,7 @@ fn serverless_spec(c: &ServerlessCache) -> Spec {
             "clusterId",
             c.serverless_cache_name().unwrap_or_default(),
         )],
+        access_log_sources: Vec::new(),
         log_sources: Vec::new(),
         notes: Vec::new(),
     }

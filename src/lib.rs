@@ -1,10 +1,14 @@
 //! `awstate` snapshots the recent state of RDS, `ElastiCache`, EC2 Auto
-//! Scaling, and ECS resources
+//! Scaling, ECS, Application Load Balancer, and `CloudFront` resources
 //! (inventory, `CloudWatch` metrics, logs, and service events) into a
 //! directory designed to be handed to an AI model for analysis.
 
+mod access_logs;
+mod alb;
 mod asg;
 pub mod cli;
+mod cloudfront;
+mod cloudtrail;
 mod collect;
 mod ecr;
 mod ecs;
@@ -24,8 +28,13 @@ use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_credential_types::provider::ProvideCredentials;
 use chrono::Utc;
 
+use access_logs::AccessLogReader;
 use cli::{Args, DataKind, Service, Severity};
 use model::{Ctx, Issues, ServiceReport, Window};
+
+/// Where global services (`CloudFront`) publish metrics, log deliveries,
+/// and `CloudTrail` events.
+const GLOBAL_SERVICES_REGION: &str = "us-east-1";
 
 /// What a finished run produced.
 pub struct Snapshot {
@@ -55,15 +64,24 @@ pub async fn run(args: Args) -> Result<Snapshot> {
         .await
         .with_context(|| format!("creating output directory {}", root.display()))?;
 
+    let us_east_1 = config
+        .to_builder()
+        .region(Region::new(GLOBAL_SERVICES_REGION))
+        .build();
     let ctx = Ctx {
         window,
         cw: aws_sdk_cloudwatch::Client::new(&config),
         logs: aws_sdk_cloudwatchlogs::Client::new(&config),
+        cw_us_east_1: aws_sdk_cloudwatch::Client::new(&us_east_1),
+        logs_us_east_1: aws_sdk_cloudwatchlogs::Client::new(&us_east_1),
+        access_logs: AccessLogReader::new(&config, &us_east_1),
         root,
         metric_period,
         max_log_events: args.max_log_events,
         log_filter_pattern: args.log_filter_pattern.clone(),
         max_log_file_bytes: args.max_log_file_bytes,
+        max_access_log_bytes: args.max_access_log_bytes,
+        access_log_lines: args.access_log_lines,
         concurrency: usize::from(args.concurrency),
         filter: args.filter.clone(),
         metrics: !args.skip.contains(&DataKind::Metrics),
@@ -72,58 +90,7 @@ pub async fn run(args: Args) -> Result<Snapshot> {
         issues: Issues::default(),
     };
 
-    let want_rds = args.services.contains(&Service::Rds);
-    let want_elasticache = args.services.contains(&Service::Elasticache);
-    let rds_client = aws_sdk_rds::Client::new(&config);
-    let elasticache_client = aws_sdk_elasticache::Client::new(&config);
-
-    let want_asg = args.services.contains(&Service::Asg);
-    let want_ecs = args.services.contains(&Service::Ecs);
-    let asg_client = aws_sdk_autoscaling::Client::new(&config);
-    let ecs_client = aws_sdk_ecs::Client::new(&config);
-    let registry_client = aws_sdk_ecr::Client::new(&config);
-
-    let (rds_report, elasticache_report, asg_report, ecs_report) = tokio::join!(
-        async {
-            if want_rds {
-                Some(rds::collect(&ctx, &rds_client).await)
-            } else {
-                None
-            }
-        },
-        async {
-            if want_elasticache {
-                Some(elasticache::collect(&ctx, &elasticache_client).await)
-            } else {
-                None
-            }
-        },
-        async {
-            if want_asg {
-                Some(asg::collect(&ctx, &asg_client).await)
-            } else {
-                None
-            }
-        },
-        async {
-            if want_ecs {
-                let images = ecr::ImageChecker::new(registry_client, &region);
-                Some(ecs::collect(&ctx, &ecs_client, &images).await)
-            } else {
-                None
-            }
-        }
-    );
-
-    let services: Vec<(&str, ServiceReport)> = [
-        ("rds", rds_report),
-        ("elasticache", elasticache_report),
-        ("asg", asg_report),
-        ("ecs", ecs_report),
-    ]
-    .into_iter()
-    .filter_map(|(name, report)| Some((name, report?)))
-    .collect();
+    let services = collect_services(&ctx, &args, &config, &us_east_1, &region).await;
 
     let findings = findings::evaluate(&services, &ctx.issues.snapshot());
     report::write(&ctx, &region, &services, &findings).await?;
@@ -150,6 +117,91 @@ pub async fn run(args: Args) -> Result<Snapshot> {
         root: ctx.root,
         worst: findings.first().map(|f| f.severity),
     })
+}
+
+/// Collects every requested service concurrently, in a fixed order.
+async fn collect_services(
+    ctx: &Ctx,
+    args: &Args,
+    config: &SdkConfig,
+    us_east_1: &SdkConfig,
+    region: &str,
+) -> Vec<(&'static str, ServiceReport)> {
+    let want_rds = args.services.contains(&Service::Rds);
+    let want_elasticache = args.services.contains(&Service::Elasticache);
+    let rds_client = aws_sdk_rds::Client::new(config);
+    let elasticache_client = aws_sdk_elasticache::Client::new(config);
+
+    let want_asg = args.services.contains(&Service::Asg);
+    let want_ecs = args.services.contains(&Service::Ecs);
+    let asg_client = aws_sdk_autoscaling::Client::new(config);
+    let ecs_client = aws_sdk_ecs::Client::new(config);
+    let registry_client = aws_sdk_ecr::Client::new(config);
+
+    let want_alb = args.services.contains(&Service::Alb);
+    let want_cloudfront = args.services.contains(&Service::Cloudfront);
+    let alb_client = aws_sdk_elasticloadbalancingv2::Client::new(config);
+    let cloudfront_client = aws_sdk_cloudfront::Client::new(us_east_1);
+    let trail_client = aws_sdk_cloudtrail::Client::new(config);
+    let trail_us_east_1_client = aws_sdk_cloudtrail::Client::new(us_east_1);
+
+    let (rds_report, elasticache_report, asg_report, ecs_report, alb_report, cloudfront_report) = tokio::join!(
+        async {
+            if want_rds {
+                Some(rds::collect(ctx, &rds_client).await)
+            } else {
+                None
+            }
+        },
+        async {
+            if want_elasticache {
+                Some(elasticache::collect(ctx, &elasticache_client).await)
+            } else {
+                None
+            }
+        },
+        async {
+            if want_asg {
+                Some(asg::collect(ctx, &asg_client).await)
+            } else {
+                None
+            }
+        },
+        async {
+            if want_ecs {
+                let images = ecr::ImageChecker::new(registry_client, region);
+                Some(ecs::collect(ctx, &ecs_client, &images).await)
+            } else {
+                None
+            }
+        },
+        async {
+            if want_alb {
+                Some(alb::collect(ctx, &alb_client, &trail_client).await)
+            } else {
+                None
+            }
+        },
+        async {
+            if want_cloudfront {
+                Some(cloudfront::collect(ctx, &cloudfront_client, &trail_us_east_1_client).await)
+            } else {
+                None
+            }
+        }
+    );
+
+    [
+        ("rds", rds_report),
+        ("elasticache", elasticache_report),
+        ("asg", asg_report),
+        ("ecs", ecs_report),
+        ("alb", alb_report),
+        ("cloudfront", cloudfront_report),
+    ]
+    .into_iter()
+    .filter_map(|(name, report)| Some((name, report?)))
+    .collect()
 }
 
 /// Loads AWS configuration and verifies that a region and working

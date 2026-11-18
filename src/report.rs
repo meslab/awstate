@@ -110,6 +110,9 @@ fn render_summary(
          `min`/`max` are the extremes of per-period minimums/maximums, `p95` is the 95th \
          percentile of per-period averages, `first`/`last` are the per-period averages at the \
          window edges, and `max at` is when the maximum occurred.\n\
+         - Metrics marked `(sum)` are counts fetched as per-period sums (requests, \
+         5xx responses, bytes); their statistics describe those sums and `total` is the sum \
+         over the whole window.\n\
          - Values are in the metric's native CloudWatch unit (bytes, seconds, percent, count). \
          `k`/`M`/`G`/`T` suffixes are decimal multipliers.\n\
          - Full time series are in each resource's `metrics.json`; complete resource details \
@@ -175,16 +178,17 @@ fn render_resource(md: &mut String, r: &Resource) {
     if let Some(file) = &r.metrics_file {
         let _ = writeln!(md, "\nMetrics (series in `{file}`):\n");
         md.push_str(
-            "| namespace | metric | dimensions | avg | min | max | p95 | first | last | max at |\n",
+            "| namespace | metric | dimensions | avg | min | max | p95 | first | last | max at | total |\n",
         );
-        md.push_str("|---|---|---|---|---|---|---|---|---|---|\n");
+        md.push_str("|---|---|---|---|---|---|---|---|---|---|---|\n");
         for m in &r.metrics {
             let s = &m.summary;
             let _ = writeln!(
                 md,
-                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                "| {} | {}{} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                 m.namespace,
                 m.name,
+                if m.statistic.is_some() { " (sum)" } else { "" },
                 extra_dimensions(m, &r.id),
                 fmt_num(s.avg),
                 fmt_num(s.min),
@@ -193,6 +197,7 @@ fn render_resource(md: &mut String, r: &Resource) {
                 fmt_num(s.first),
                 fmt_num(s.last),
                 s.max_at,
+                s.total.map_or_else(String::new, fmt_num),
             );
         }
     } else {

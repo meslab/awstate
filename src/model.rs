@@ -10,6 +10,9 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::access_logs::{AccessLogReader, AccessLogSource};
+use crate::cli::AccessLogLines;
+
 /// The time window being collected.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct Window {
@@ -50,11 +53,18 @@ pub struct Ctx {
     pub window: Window,
     pub cw: aws_sdk_cloudwatch::Client,
     pub logs: aws_sdk_cloudwatchlogs::Client,
+    /// Clients for global services (`CloudFront`), which report to
+    /// us-east-1 whatever the home region.
+    pub cw_us_east_1: aws_sdk_cloudwatch::Client,
+    pub logs_us_east_1: aws_sdk_cloudwatchlogs::Client,
+    pub access_logs: AccessLogReader,
     pub root: PathBuf,
     pub metric_period: i32,
     pub max_log_events: usize,
     pub log_filter_pattern: Option<String>,
     pub max_log_file_bytes: usize,
+    pub max_access_log_bytes: u64,
+    pub access_log_lines: AccessLogLines,
     pub concurrency: usize,
     pub filter: Vec<String>,
     pub metrics: bool,
@@ -67,6 +77,22 @@ impl Ctx {
     /// Whether a resource identifier passes the user's `--filter`.
     pub fn wanted(&self, id: &str) -> bool {
         self.filter.is_empty() || self.filter.iter().any(|f| id.contains(f.as_str()))
+    }
+
+    pub fn cw_for(&self, us_east_1: bool) -> &aws_sdk_cloudwatch::Client {
+        if us_east_1 {
+            &self.cw_us_east_1
+        } else {
+            &self.cw
+        }
+    }
+
+    pub fn logs_for(&self, us_east_1: bool) -> &aws_sdk_cloudwatchlogs::Client {
+        if us_east_1 {
+            &self.logs_us_east_1
+        } else {
+            &self.logs
+        }
     }
 }
 
@@ -115,6 +141,13 @@ pub struct MetricSource {
     /// excluded. Needed where a parent's dimension also appears on its
     /// children's metrics (an ECS cluster and its services).
     pub exact: bool,
+    /// Whether the metrics are published in us-east-1 rather than the home
+    /// region.
+    pub us_east_1: bool,
+    /// Picks the metrics whose only meaningful statistic is `Sum`, such as
+    /// load balancer request counts, whose `Average`, `Minimum`, and
+    /// `Maximum` are always 1. These are fetched as per-period sums.
+    pub summed: Option<fn(&str) -> bool>,
 }
 
 impl MetricSource {
@@ -124,6 +157,8 @@ impl MetricSource {
             namespace,
             dimensions: vec![(dimension, value.to_owned())],
             exact: false,
+            us_east_1: false,
+            summed: None,
         }
     }
 
@@ -133,7 +168,23 @@ impl MetricSource {
             namespace,
             dimensions,
             exact: true,
+            us_east_1: false,
+            summed: None,
         }
+    }
+
+    pub fn in_us_east_1(mut self) -> Self {
+        self.us_east_1 = true;
+        self
+    }
+
+    pub fn summing(mut self, summed: fn(&str) -> bool) -> Self {
+        self.summed = Some(summed);
+        self
+    }
+
+    pub fn is_summed(&self, metric_name: &str) -> bool {
+        self.summed.is_some_and(|summed| summed(metric_name))
     }
 }
 
@@ -142,6 +193,7 @@ impl MetricSource {
 pub struct LogSource {
     pub group: String,
     pub stream_prefix: Option<String>,
+    pub us_east_1: bool,
 }
 
 impl From<String> for LogSource {
@@ -149,6 +201,7 @@ impl From<String> for LogSource {
         Self {
             group,
             stream_prefix: None,
+            us_east_1: false,
         }
     }
 }
@@ -161,6 +214,7 @@ pub struct Spec {
     pub details: Value,
     pub metric_sources: Vec<MetricSource>,
     pub log_sources: Vec<LogSource>,
+    pub access_log_sources: Vec<AccessLogSource>,
     pub notes: Vec<String>,
 }
 
@@ -212,6 +266,11 @@ pub struct MetricHead {
     pub namespace: String,
     pub name: String,
     pub dimensions: BTreeMap<String, String>,
+    /// `Sum` for metrics fetched as per-period sums; the summary's `avg`,
+    /// `min`, `max`, and `p95` are then over those sums. Absent for the
+    /// default `Average`/`Minimum`/`Maximum`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub statistic: Option<&'static str>,
     pub summary: MetricSummary,
 }
 
@@ -237,6 +296,9 @@ pub struct MetricSummary {
     /// so, like connections to a database whose clients died.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zero_since: Option<String>,
+    /// Sum over the whole window, for metrics fetched as sums.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<f64>,
 }
 
 /// One period of a series: `(time, avg, min, max)`.

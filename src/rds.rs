@@ -183,6 +183,7 @@ fn instance_spec(i: &DbInstance) -> Spec {
             "DBInstanceIdentifier",
             i.db_instance_identifier().unwrap_or_default(),
         )],
+        access_log_sources: Vec::new(),
         log_sources,
         notes: Vec::new(),
     }
@@ -227,6 +228,7 @@ fn cluster_spec(c: &DbCluster) -> Spec {
     Spec {
         service: SERVICE,
         kind: "cluster",
+        access_log_sources: Vec::new(),
         log_sources: exports
             .iter()
             .map(|kind| LogSource::from(format!("/aws/rds/cluster/{id}/{kind}")))

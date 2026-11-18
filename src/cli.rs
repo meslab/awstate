@@ -10,8 +10,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use clap::{Parser, ValueEnum};
 
-/// Pull RDS, ElastiCache, EC2 Auto Scaling, and ECS metrics, logs, and events for a time window
-/// into a directory laid out for AI analysis.
+/// Pull RDS, ElastiCache, EC2 Auto Scaling, ECS, Application Load Balancer, and CloudFront
+/// metrics, logs, and events for a time window into a directory laid out for AI analysis.
 #[derive(Debug, Parser)]
 #[command(version, about)]
 pub struct Args {
@@ -36,7 +36,7 @@ pub struct Args {
     pub profile: Option<String>,
 
     /// Services to collect.
-    #[arg(long, value_enum, value_delimiter = ',', default_values_t = [Service::Rds, Service::Elasticache, Service::Asg, Service::Ecs])]
+    #[arg(long, value_enum, value_delimiter = ',', default_values_t = [Service::Rds, Service::Elasticache, Service::Asg, Service::Ecs, Service::Alb, Service::Cloudfront])]
     pub services: Vec<Service>,
 
     /// Data kinds to skip.
@@ -57,7 +57,8 @@ pub struct Args {
     #[arg(long, value_parser = clap::value_parser!(i32).range(1..))]
     pub metric_period: Option<i32>,
 
-    /// Maximum events to pull per CloudWatch log group (earliest first).
+    /// Maximum events to pull per CloudWatch log group (earliest first), and
+    /// lines to keep per S3 access log (latest first).
     #[arg(long, default_value_t = 5000)]
     pub max_log_events: usize,
 
@@ -71,6 +72,15 @@ pub struct Args {
     /// 0 disables these downloads.
     #[arg(long, default_value_t = 1_048_576)]
     pub max_log_file_bytes: usize,
+
+    /// Compressed-byte budget per load balancer or distribution for access
+    /// log files downloaded from S3, newest first. 0 disables these downloads.
+    #[arg(long, default_value_t = 64 * 1_048_576)]
+    pub max_access_log_bytes: u64,
+
+    /// Which S3 access log lines to keep.
+    #[arg(long, value_enum, default_value_t = AccessLogLines::Errors)]
+    pub access_log_lines: AccessLogLines,
 
     /// Number of resources collected concurrently.
     #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]
@@ -97,6 +107,19 @@ pub enum Service {
     Asg,
     /// Amazon ECS clusters and services.
     Ecs,
+    /// Application Load Balancers.
+    Alb,
+    /// Amazon CloudFront distributions.
+    Cloudfront,
+}
+
+/// Which lines of S3 access logs to keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AccessLogLines {
+    /// Requests answered with 4xx/5xx, or not answered.
+    Errors,
+    /// Every request.
+    All,
 }
 
 /// A kind of data collected per resource.
@@ -104,9 +127,9 @@ pub enum Service {
 pub enum DataKind {
     /// CloudWatch metrics.
     Metrics,
-    /// CloudWatch Logs and RDS log files.
+    /// CloudWatch Logs, RDS log files, and S3 access logs.
     Logs,
-    /// Service events.
+    /// Service events, and configuration changes from CloudTrail.
     Events,
 }
 

@@ -14,7 +14,10 @@
       "Sid": "CloudWatchLogs",
       "Effect": "Allow",
       "Action": [
-        "logs:FilterLogEvents"
+        "logs:FilterLogEvents",
+        "logs:DescribeDeliverySources",
+        "logs:DescribeDeliveries",
+        "logs:DescribeDeliveryDestinations"
       ],
       "Resource": "*"
     },
@@ -90,6 +93,48 @@
         "ecr:DescribePullThroughCacheRules"
       ],
       "Resource": "*"
+    },
+    {
+      "Sid": "LoadBalancingRead",
+      "Effect": "Allow",
+      "Action": [
+        "elasticloadbalancing:DescribeLoadBalancers",
+        "elasticloadbalancing:DescribeLoadBalancerAttributes",
+        "elasticloadbalancing:DescribeListeners",
+        "elasticloadbalancing:DescribeTargetGroups",
+        "elasticloadbalancing:DescribeTargetHealth"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CloudFrontRead",
+      "Effect": "Allow",
+      "Action": [
+        "cloudfront:ListDistributions",
+        "cloudfront:GetDistribution",
+        "cloudfront:GetMonitoringSubscription"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CloudTrailChanges",
+      "Effect": "Allow",
+      "Action": [
+        "cloudtrail:LookupEvents"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AccessLogsRead",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetBucketLocation",
+        "s3:ListBucket",
+        "s3:GetObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::*"
+      ]
     }
   ]
 }
