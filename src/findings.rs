@@ -482,6 +482,7 @@ fn asg(r: &Resource, events: &[Event], push: &mut Push) {
                 .iter()
                 .any(|c| c == "Failed" || c == "Cancelled")
         })
+        .filter(|e| !scale_in_completed_after_protection(&own, e))
         .collect();
     if let Some(latest) = failed.last() {
         push(
@@ -512,6 +513,28 @@ fn asg(r: &Resource, events: &[Event], push: &mut Push) {
             format!("{interruptions} instance(s) replaced after Spot interruption notices"),
         );
     }
+}
+
+/// ECS managed termination protection cancels a scale-in until the instance
+/// is drained, then unprotects it and the scale-in goes through; only a
+/// cancellation that no termination follows means capacity is stuck.
+fn scale_in_completed_after_protection(group_events: &[&Event], cancelled: &Event) -> bool {
+    let blocked_by_protection = cancelled.categories.iter().any(|c| c == "Cancelled")
+        && cancelled
+            .message
+            .as_deref()
+            .is_some_and(|m| m.contains("protected from scale-in"));
+    let Some(cancelled_at) = cancelled.time.as_deref() else {
+        return false;
+    };
+    blocked_by_protection
+        && group_events.iter().any(|e| {
+            e.categories.iter().any(|c| c == "Successful")
+                && e.message
+                    .as_deref()
+                    .is_some_and(|m| m.starts_with("Terminating"))
+                && e.time.as_deref().is_some_and(|t| t > cancelled_at)
+        })
 }
 
 fn alb(r: &Resource, push: &mut Push) {
@@ -950,6 +973,48 @@ mod tests {
         assert_eq!(
             checks("asg", vec![r], events),
             ["scaling-failed", "spot-interruptions"]
+        );
+    }
+
+    #[test]
+    fn asg_ignores_scale_in_protection_that_a_termination_resolves() {
+        let at = |time: &str, categories: &[&str], message: &str| Event {
+            time: Some(time.to_owned()),
+            ..event("g", categories, message)
+        };
+        let blocked = "Could not scale to desired capacity because all remaining \
+                       instances are protected from scale-in.";
+        let evaluate_with_events = |events: Vec<Event>| {
+            let r = resource(
+                "asg",
+                "group",
+                "g",
+                json!({"desired_capacity": 0, "instances": []}),
+            );
+            checks("asg", vec![r], events)
+        };
+
+        assert_eq!(
+            evaluate_with_events(vec![
+                at("2026-11-17T20:57:19Z", &["Cancelled"], blocked),
+                at(
+                    "2026-11-17T20:57:29Z",
+                    &["Successful"],
+                    "Terminating EC2 instance: i-1"
+                ),
+            ]),
+            [] as [&str; 0]
+        );
+        assert_eq!(
+            evaluate_with_events(vec![
+                at(
+                    "2026-11-17T20:51:34Z",
+                    &["Successful"],
+                    "Terminating EC2 instance: i-1"
+                ),
+                at("2026-11-17T20:57:19Z", &["Cancelled"], blocked),
+            ]),
+            ["scaling-failed"]
         );
     }
 
