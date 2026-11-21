@@ -17,6 +17,179 @@ use crate::model::{Ctx, Event, Issue, MetricHead, Resource, ServiceReport, Windo
 const SUMMARY_EVENT_LIMIT: usize = 300;
 
 const FINDINGS_FILE: &str = "findings.json";
+const MANIFEST_FILE: &str = "manifest.json";
+const SUMMARY_FILE: &str = "summary.md";
+
+/// Critical and warning findings listed in the run report; the rest are
+/// counted and left to `findings.json`.
+const RUN_REPORT_FINDING_LIMIT: usize = 50;
+
+/// What a run printed to stdout: enough to decide where to look next
+/// without opening the snapshot.
+#[derive(Serialize)]
+pub struct RunReport {
+    snapshot_dir: String,
+    read_first: String,
+    findings_file: String,
+    manifest_file: String,
+    region: String,
+    window: Window,
+    metric_period_seconds: i32,
+    services: Vec<ServiceCount>,
+    finding_counts: SeverityCounts,
+    /// Critical and warning findings, most severe first.
+    findings: Vec<Finding>,
+    findings_omitted: usize,
+    collection_issues: Vec<Issue>,
+}
+
+#[derive(Serialize)]
+struct ServiceCount {
+    service: String,
+    resources: usize,
+    events: usize,
+}
+
+#[derive(Serialize)]
+struct SeverityCounts {
+    critical: usize,
+    warning: usize,
+    info: usize,
+}
+
+impl RunReport {
+    pub fn new(
+        ctx: &Ctx,
+        region: &str,
+        services: &[(&str, ServiceReport)],
+        findings: &[Finding],
+    ) -> Self {
+        let path = |name: &str| ctx.root.join(name).display().to_string();
+        let count = |severity| findings.iter().filter(|f| f.severity == severity).count();
+        let actionable: Vec<Finding> = findings
+            .iter()
+            .filter(|f| f.severity > Severity::Info)
+            .cloned()
+            .collect();
+        Self {
+            snapshot_dir: ctx.root.display().to_string(),
+            read_first: path(SUMMARY_FILE),
+            findings_file: path(FINDINGS_FILE),
+            manifest_file: path(MANIFEST_FILE),
+            region: region.to_owned(),
+            window: ctx.window,
+            metric_period_seconds: ctx.metric_period,
+            services: services
+                .iter()
+                .map(|(name, report)| ServiceCount {
+                    service: (*name).to_owned(),
+                    resources: report.resources.len(),
+                    events: report.events.len(),
+                })
+                .collect(),
+            finding_counts: SeverityCounts {
+                critical: count(Severity::Critical),
+                warning: count(Severity::Warning),
+                info: count(Severity::Info),
+            },
+            findings_omitted: actionable.len().saturating_sub(RUN_REPORT_FINDING_LIMIT),
+            findings: actionable
+                .into_iter()
+                .take(RUN_REPORT_FINDING_LIMIT)
+                .collect(),
+            collection_issues: ctx.issues.snapshot(),
+        }
+    }
+
+    /// # Errors
+    ///
+    /// Fails only if serialization fails, which plain data does not.
+    pub fn to_json(&self) -> serde_json::Result<String> {
+        serde_json::to_string_pretty(self)
+    }
+
+    // `write!` into a `String` is infallible, so its results are discarded.
+    pub fn to_text(&self) -> String {
+        let mut out = String::new();
+        let _ = writeln!(out, "snapshot:   {}", self.snapshot_dir);
+        let _ = writeln!(
+            out,
+            "window:     {} to {} UTC, region {}, metric period {}s",
+            iso_chrono(self.window.start),
+            iso_chrono(self.window.end),
+            self.region,
+            self.metric_period_seconds
+        );
+        let _ = writeln!(out, "read first: {}", self.read_first);
+        let _ = writeln!(out, "findings:   {}", self.findings_file);
+        let _ = writeln!(out, "manifest:   {}", self.manifest_file);
+
+        out.push_str("\nservices:\n");
+        let name_width = self
+            .services
+            .iter()
+            .map(|s| s.service.len())
+            .max()
+            .unwrap_or(0);
+        for s in &self.services {
+            let _ = writeln!(
+                out,
+                "  {:name_width$}  {:>4} resources  {:>5} events",
+                s.service, s.resources, s.events
+            );
+        }
+
+        let c = &self.finding_counts;
+        let _ = writeln!(
+            out,
+            "\nfindings: {} critical, {} warning, {} info",
+            c.critical, c.warning, c.info
+        );
+        for f in &self.findings {
+            let resource = if f.resource.is_empty() {
+                "-"
+            } else {
+                &f.resource
+            };
+            let _ = writeln!(
+                out,
+                "  {:8}  {}  {}  {}: {}",
+                severity_label(f.severity),
+                f.service,
+                resource,
+                f.check,
+                one_line(&f.message)
+            );
+        }
+        if self.findings_omitted > 0 {
+            let _ = writeln!(
+                out,
+                "  ... {} more in {}",
+                self.findings_omitted, self.findings_file
+            );
+        }
+
+        if !self.collection_issues.is_empty() {
+            let _ = writeln!(
+                out,
+                "\ncollection issues: {} (data for these is incomplete)",
+                self.collection_issues.len()
+            );
+            for issue in &self.collection_issues {
+                let _ = writeln!(out, "  {}: {}", issue.scope, one_line(&issue.error));
+            }
+        }
+        out
+    }
+}
+
+fn severity_label(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Critical => "critical",
+        Severity::Warning => "warning",
+        Severity::Info => "info",
+    }
+}
 
 #[derive(Serialize)]
 struct Manifest<'a> {
@@ -80,10 +253,10 @@ pub async fn write(
         services: manifests,
         issues: &issues,
     };
-    write_json(ctx, "manifest.json", &manifest).await?;
+    write_json(ctx, MANIFEST_FILE, &manifest).await?;
 
     let summary = render_summary(ctx, region, services, findings, &issues);
-    write_file(ctx, "summary.md", summary.as_bytes()).await
+    write_file(ctx, SUMMARY_FILE, summary.as_bytes()).await
 }
 
 // `write!` into a `String` is infallible, so its results are discarded.
@@ -432,6 +605,74 @@ mod tests {
         assert_eq!(groups[0].latest.time.as_deref(), Some("t3"));
         assert_eq!(groups[1].count, 1);
         assert_eq!(groups[2].first, Some("t4"));
+    }
+
+    fn run_report() -> RunReport {
+        let at = |s: &str| s.parse().unwrap();
+        RunReport {
+            snapshot_dir: "snap".to_owned(),
+            read_first: "snap/summary.md".to_owned(),
+            findings_file: "snap/findings.json".to_owned(),
+            manifest_file: "snap/manifest.json".to_owned(),
+            region: "eu-west-1".to_owned(),
+            window: Window {
+                start: at("2026-11-19T00:00:00Z"),
+                end: at("2026-11-20T00:00:00Z"),
+            },
+            metric_period_seconds: 300,
+            services: vec![ServiceCount {
+                service: "rds".to_owned(),
+                resources: 2,
+                events: 14,
+            }],
+            finding_counts: SeverityCounts {
+                critical: 1,
+                warning: 0,
+                info: 3,
+            },
+            findings: vec![Finding {
+                severity: Severity::Critical,
+                service: "rds".to_owned(),
+                resource: "db-1".to_owned(),
+                check: "storage-low",
+                message: "free storage\n2%".to_owned(),
+            }],
+            findings_omitted: 0,
+            collection_issues: vec![Issue {
+                scope: "rds/instance/db-1 logs".to_owned(),
+                error: "AccessDenied".to_owned(),
+            }],
+        }
+    }
+
+    #[test]
+    fn run_report_text_lists_paths_findings_and_issues() {
+        assert_eq!(
+            run_report().to_text(),
+            "snapshot:   snap\n\
+             window:     2026-11-19T00:00:00Z to 2026-11-20T00:00:00Z UTC, region eu-west-1, metric period 300s\n\
+             read first: snap/summary.md\n\
+             findings:   snap/findings.json\n\
+             manifest:   snap/manifest.json\n\
+             \n\
+             services:\n\
+             \x20 rds     2 resources     14 events\n\
+             \n\
+             findings: 1 critical, 0 warning, 3 info\n\
+             \x20 critical  rds  db-1  storage-low: free storage 2%\n\
+             \n\
+             collection issues: 1 (data for these is incomplete)\n\
+             \x20 rds/instance/db-1 logs: AccessDenied\n"
+        );
+    }
+
+    #[test]
+    fn run_report_json_round_trips() {
+        let json: serde_json::Value =
+            serde_json::from_str(&run_report().to_json().unwrap()).unwrap();
+        assert_eq!(json["finding_counts"]["critical"], 1);
+        assert_eq!(json["findings"][0]["check"], "storage-low");
+        assert_eq!(json["collection_issues"][0]["error"], "AccessDenied");
     }
 
     #[test]

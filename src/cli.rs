@@ -91,6 +91,12 @@ pub struct Args {
     #[arg(long, value_enum)]
     pub fail_on: Option<Severity>,
 
+    /// Format of the run report printed to stdout: where the snapshot is,
+    /// what to read first, findings that need attention, and collection
+    /// issues. The snapshot directory is the same either way.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+
     /// Verbose progress logging (repeat for more).
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
@@ -120,6 +126,15 @@ pub enum AccessLogLines {
     Errors,
     /// Every request.
     All,
+}
+
+/// Format of the run report printed to stdout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    /// Aligned plain text.
+    Text,
+    /// One JSON object, for scripts and AI agents.
+    Json,
 }
 
 /// A kind of data collected per resource.
