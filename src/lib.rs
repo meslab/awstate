@@ -31,6 +31,7 @@ use chrono::Utc;
 use access_logs::AccessLogReader;
 use cli::{Args, DataKind, Service, Severity};
 use model::{Ctx, Issues, ServiceReport, Window};
+pub use report::RunReport;
 
 /// Where global services (`CloudFront`) publish metrics, log deliveries,
 /// and `CloudTrail` events.
@@ -38,10 +39,10 @@ const GLOBAL_SERVICES_REGION: &str = "us-east-1";
 
 /// What a finished run produced.
 pub struct Snapshot {
-    /// The output directory.
-    pub root: PathBuf,
     /// Severity of the most severe finding, if any.
     pub worst: Option<Severity>,
+    /// What to print to stdout.
+    pub report: RunReport,
 }
 
 /// Runs a full collection and returns where it was written.
@@ -95,27 +96,10 @@ pub async fn run(args: Args) -> Result<Snapshot> {
     let findings = findings::evaluate(&services, &ctx.issues.snapshot());
     report::write(&ctx, &region, &services, &findings).await?;
 
-    for (name, report) in &services {
-        println!(
-            "{name}: {} resources, {} events",
-            report.resources.len(),
-            report.events.len()
-        );
-    }
-    let issues = ctx.issues.snapshot().len();
-    if issues > 0 {
-        println!("{issues} collection issue(s); see summary.md");
-    }
-    let count = |severity| findings.iter().filter(|f| f.severity == severity).count();
-    println!(
-        "findings: {} critical, {} warning, {} info",
-        count(Severity::Critical),
-        count(Severity::Warning),
-        count(Severity::Info)
-    );
+    let report = report::RunReport::new(&ctx, &region, &services, &findings);
     Ok(Snapshot {
-        root: ctx.root,
         worst: findings.first().map(|f| f.severity),
+        report,
     })
 }
 

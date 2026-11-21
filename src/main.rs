@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 
-use awstate::cli::Args;
+use awstate::cli::{Args, OutputFormat};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -20,10 +20,12 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let fail_on = args.fail_on;
+    let (fail_on, format) = (args.fail_on, args.format);
     let snapshot = awstate::run(args).await?;
-    println!("snapshot written to {}", snapshot.root.display());
-    println!("start with {}", snapshot.root.join("summary.md").display());
+    match format {
+        OutputFormat::Text => print!("{}", snapshot.report.to_text()),
+        OutputFormat::Json => println!("{}", snapshot.report.to_json()?),
+    }
     if let (Some(threshold), Some(worst)) = (fail_on, snapshot.worst)
         && worst >= threshold
     {
