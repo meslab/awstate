@@ -2,6 +2,13 @@
 name = "awstate"
 version = "0.1.0"
 edition = "2024"
+description = "Snapshot AWS RDS, ElastiCache, ASG, ECS, ALB and CloudFront state for analysis"
+license = "MIT"
+repository = "https://github.com/meslab/awstate"
+homepage = "https://github.com/meslab/awstate"
+readme = "README.md"
+keywords = ["aws", "cloudwatch", "observability", "incident", "cli"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0.104"

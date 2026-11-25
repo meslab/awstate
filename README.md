@@ -141,3 +141,7 @@ listed as collection issues.
 ```sh
 make format lint test
 ```
+
+## License
+
+[MIT](LICENSE)
