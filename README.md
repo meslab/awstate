@@ -11,6 +11,18 @@ awstate --profile prod --region eu-west-1 --last 6h --format json
 
 ## Install
 
+### Homebrew
+
+```sh
+brew install meslab/tap/awstate
+```
+
+Prebuilt bottles cover Apple Silicon on macOS 26 and x86_64 Linux; other
+platforms build from source, which needs no extra setup but takes a few
+minutes.
+
+### From source
+
 ```sh
 make install            # release build, stripped, copied to ~/.local/bin
 make install PREFIX=/usr/local/bin
